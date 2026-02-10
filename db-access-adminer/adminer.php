@@ -5,13 +5,13 @@
 * @copyright 2007 Jakub Vrana
 * @license https://www.apache.org/licenses/LICENSE-2.0 Apache License, Version 2.0
 * @license https://www.gnu.org/licenses/gpl-2.0.html GNU General Public License, version 2 (one or other)
-* @version 5.4.1
+* @version 5.4.2
 */
 // this is matched by compile.php
 
 namespace Adminer;
 
-const VERSION = "5.4.1";
+const VERSION = "5.4.2";
 
 if (!defined('\Lev0\DbAccessAdminer\OK')) { # no direct execution
 	exit;
@@ -117,24 +117,19 @@ function number_type() {
 }
 
 /** Disable magic_quotes_gpc
-* @param list<array> $process e.g. [&$_GET, &$_POST, &$_COOKIE]
+* @param mixed[] $values
 * @param bool $filter whether to leave values as is
-* @return void modified in place
+* @return mixed[]
 */
-function remove_slashes(array $process, $filter = false) {
-	if (function_exists("get_magic_quotes_gpc") && get_magic_quotes_gpc()) {
-		while (list($key, $val) = each($process)) {
-			foreach ($val as $k => $v) {
-				unset($process[$key][$k]);
-				if (is_array($v)) {
-					$process[$key][stripslashes($k)] = $v;
-					$process[] = &$process[$key][stripslashes($k)];
-				} else {
-					$process[$key][stripslashes($k)] = ($filter ? $v : stripslashes($v));
-				}
-			}
-		}
+function remove_slashes(array $values, $filter = false) {
+	$return = array();
+	foreach ($values as $key => $val) {
+		$return[stripslashes($key)] = (is_array($val)
+			? remove_slashes($val, $filter)
+			: ($filter ? $val : stripslashes($val))
+		);
 	}
+	return $return;
 }
 
 /** Escape or unescape string to use inside form [] */
@@ -285,7 +280,7 @@ function get_rows($query, $connection2 = null, $error = "<p class='error'>") {
 */
 function unique_array($row, array $indexes) {
 	foreach ($indexes as $index) {
-		if (preg_match("~PRIMARY|UNIQUE~", $index["type"])) {
+		if (preg_match("~PRIMARY|UNIQUE~", $index["type"]) && !$index["partial"]) {
 			$return = array();
 			foreach ($index["columns"] as $key) {
 				if (!isset($row[$key])) { // NULL is ambiguous
@@ -375,7 +370,7 @@ function convert_fields(array $columns, array $fields, array $select = array()) 
 */
 function cookie($name, $value, $lifetime = 2592000) {
 	header(
-		"Set-Cookie: $name=" . urlencode($value)
+		"Set-Cookie: $name=" . rawurlencode($value)
 			. ($lifetime ? "; expires=" . gmdate("D, d M Y H:i:s", time() + $lifetime) . " GMT" : "")
 			. "; path=" . preg_replace('~\?.*~', '', $_SERVER["REQUEST_URI"])
 			. (HTTPS ? "; secure" : "")
@@ -516,7 +511,7 @@ function queries($query) {
 	if (!Queries::$start) {
 		Queries::$start = microtime(true);
 	}
-	Queries::$queries[] = (preg_match('~;$~', $query) ? "DELIMITER ;;\n$query;\nDELIMITER " : $query) . ";";
+	Queries::$queries[] = (driver()->delimiter != ';' ? $query : (preg_match('~;$~', $query) ? "DELIMITER ;;\n$query;\nDELIMITER " : $query) . ";");
 	return connection()->query($query);
 }
 
@@ -697,12 +692,13 @@ function dump_headers($identifier, $multi_table = false) {
 * @param string[] $row
 */
 function dump_csv(array $row) {
+	$tsv = $_POST["format"] == "tsv";
 	foreach ($row as $key => $val) {
-		if (preg_match('~["\n,;\t]|^0.|\.\d*0$~', $val) || $val === "") {
+		if (preg_match('~["\n]|^0[^.]|\.\d*0$|' . ($tsv ? '\t' : '[,;]|^$') . '~', $val)) {
 			$row[$key] = '"' . str_replace('"', '""', $val) . '"';
 		}
 	}
-	echo implode(($_POST["format"] == "csv" ? "," : ($_POST["format"] == "tsv" ? "\t" : ";")), $row) . "\r\n";
+	echo implode(($_POST["format"] == "csv" ? "," : ($tsv ? "\t" : ";")), $row) . "\r\n";
 }
 
 /** Apply SQL function
@@ -806,19 +802,35 @@ function rand_string() {
 }
 
 /** Format value to use in select
-* @param string|string[] $val
-* @param Field $field
+* @param string|string[]|list<string[]> $val
+* @param array{type: string} $field
 * @param ?numeric-string $text_length
 * @return string HTML
 */
 function select_value($val, $link, array $field, $text_length) {
 	if (is_array($val)) {
 		$return = "";
-		foreach ($val as $k => $v) {
-			$return .= "<tr>"
-				. ($val != array_values($val) ? "<th>" . h($k) : "")
-				. "<td>" . select_value($v, $link, $field, $text_length)
-			;
+		if (array_filter($val, 'is_array') == array_values($val)) { // list of arrays
+			$keys = array();
+			foreach ($val as $v) {
+				$keys += array_fill_keys(array_keys($v), null);
+			}
+			foreach (array_keys($keys) as $k) {
+				$return .= "<th>" . h($k);
+			}
+			foreach ($val as $v) {
+				$return .= "<tr>";
+				foreach (array_merge($keys, $v) as $v2) {
+					$return .= "<td>" . select_value($v2, $link, $field, $text_length);
+				}
+			}
+		} else {
+			foreach ($val as $k => $v) {
+				$return .= "<tr>"
+					. ($val != array_values($val) ? "<th>" . h($k) : "")
+					. "<td>" . select_value($v, $link, $field, $text_length)
+				;
+			}
 		}
 		return "<table>$return</table>";
 	}
@@ -833,7 +845,7 @@ function select_value($val, $link, array $field, $text_length) {
 			$link = $val; // IE 11 and all modern browsers hide referrer
 		}
 	}
-	$return = adminer()->editVal($val, $field);
+	$return = adminer()->editVal(driver()->value($val, $field), $field);
 	if ($return !== null) {
 		if (!is_utf8($return)) {
 			$return = "\0"; // htmlspecialchars of binary data returns an empty string
@@ -847,7 +859,7 @@ function select_value($val, $link, array $field, $text_length) {
 }
 
 /** Check whether the field type is blob or equivalent
-* @param Field $field
+* @param array{type: string} $field
 */
 function is_blob(array $field) {
 	return preg_match('~blob|bytea|raw|file~', $field["type"]) && !in_array($field["type"], idx(driver()->structuredTypes(), lang(6), array()));
@@ -864,14 +876,14 @@ function is_mail($email) {
 /** Check whether the string is URL address */
 function is_url($string) {
 	$domain = '[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])'; // one domain component //! IDN
-	return preg_match("~^(https?)://($domain?\\.)+$domain(:\\d+)?(/.*)?(\\?.*)?(#.*)?\$~i", $string); //! restrict path, query and fragment characters
+	return preg_match("~^((https?):)?//($domain?\\.)+$domain(:\\d+)?(/.*)?(\\?.*)?(#.*)?\$~i", $string); //! restrict path, query and fragment characters
 }
 
 /** Check if field should be shortened
-* @param Field $field
+* @param array{type: string} $field
 */
 function is_shortable(array $field) {
-	return preg_match('~char|text|json|lob|geometry|point|linestring|polygon|string|bytea|hstore~', $field["type"]);
+	return !preg_match('~' . number_type() . '|date|time|year~', $field["type"]);
 }
 
 /** Split server into host and (port or socket)
@@ -1149,8 +1161,11 @@ function input(array $field, $value, $function, $autofocus = false) {
 	$name = h(bracket_escape($field["field"]));
 	echo "<td class='function'>";
 	if (is_array($value) && !$function) {
-		$value = json_encode($value, 128 | 64 | 256); // 128 - JSON_PRETTY_PRINT, 64 - JSON_UNESCAPED_SLASHES, 256 - JSON_UNESCAPED_UNICODE available since PHP 5.4
 		$function = "json";
+	}
+	$json = ($function == "json" || preg_match('~^jsonb?$~', $field["type"]));
+	if ($json && $value != '' && (JUSH != "pgsql" || $field["type"] != "json")) {
+		$value = json_encode(is_array($value) ? $value : json_decode($value), 128 | 64 | 256); // 128 - JSON_PRETTY_PRINT, 64 - JSON_UNESCAPED_SLASHES, 256 - JSON_UNESCAPED_UNICODE available since PHP 5.4
 	}
 	$reset = (JUSH == "mssql" && $field["auto_increment"]);
 	if ($reset && !$_POST["save"]) {
@@ -1162,8 +1177,7 @@ function input(array $field, $value, $function, $autofocus = false) {
 		$field["type"] = "enum";
 		$field["length"] = $enums;
 	}
-	$disabled = stripos($field["default"], "GENERATED ALWAYS AS ") === 0 ? " disabled=''" : "";
-	$attrs = " name='fields[$name]" . ($field["type"] == "enum" || $field["type"] == "set" ? "[]" : "") . "'$disabled" . ($autofocus ? " autofocus" : "");
+	$attrs = " name='fields[$name]" . ($field["type"] == "enum" || $field["type"] == "set" ? "[]" : "") . "'" . ($autofocus ? " autofocus" : "");
 	echo driver()->unconvertFunction($field) . " ";
 	$table = $_GET["edit"] ?: $_GET["select"];
 	if ($field["type"] == "enum") {
@@ -1171,7 +1185,7 @@ function input(array $field, $value, $function, $autofocus = false) {
 	} else {
 		$has_function = (in_array($function, $functions) || isset($functions[$function]));
 		echo (count($functions) > 1
-			? "<select name='function[$name]'$disabled>" . optionlist($functions, $function === null || $has_function ? $function : "") . "</select>"
+			? "<select name='function[$name]'>" . optionlist($functions, $function === null || $has_function ? $function : "") . "</select>"
 				. on_help("event.target.value.replace(/^SQL\$/, '')", 1)
 				. script("qsl('select').onchange = functionChange;", "")
 			: h(reset($functions))
@@ -1186,7 +1200,7 @@ function input(array $field, $value, $function, $autofocus = false) {
 			echo enum_input("checkbox", $attrs, $field, (is_string($value) ? explode(",", $value) : $value));
 		} elseif (is_blob($field) && ini_bool("file_uploads")) {
 			echo "<input type='file' name='fields-$name'>";
-		} elseif ($function == "json" || preg_match('~^jsonb?$~', $field["type"])) {
+		} elseif ($json) {
 			echo "<textarea$attrs cols='50' rows='12' class='jush-js'>" . h($value) . '</textarea>';
 		} elseif (($text = preg_match('~text|lob|memo~i', $field["type"])) || preg_match("~\n~", $value)) {
 			if ($text && JUSH != "sqlite") {
@@ -1234,15 +1248,15 @@ function input(array $field, $value, $function, $autofocus = false) {
 * @return mixed false to leave the original value
 */
 function process_input(array $field) {
-	if (stripos($field["default"], "GENERATED ALWAYS AS ") === 0) {
-		return;
-	}
 	$idf = bracket_escape($field["field"]);
 	$function = idx($_POST["function"], $idf);
 	$value = idx($_POST["fields"], $idf);
+	if ($value === null) {
+		return false;
+	}
 	if ($field["type"] == "enum" || driver()->enumLength($field)) {
-		$value = $value[0];
-		if ($value == "orig") {
+		$value = idx($value, 0);
+		if ($value == "orig" || !$value) {
 			return false;
 		}
 		if ($value == "null") {
@@ -1327,6 +1341,7 @@ function edit_form($table, array $fields, $row, $update, $error = '') {
 		return;
 	}
 	echo "<form action='' method='post' enctype='multipart/form-data' id='form'>\n";
+	$editable = false;
 	if (!$fields) {
 		echo "<p class='error'>" . lang(15) . "\n";
 	} else {
@@ -1357,30 +1372,35 @@ function edit_form($table, array $fields, $row, $update, $error = '') {
 			if (!$_POST["save"] && is_string($value)) {
 				$value = adminer()->editVal($value, $field);
 			}
-			$function = ($_POST["save"]
-				? idx($_POST["function"], $name, "")
-				: ($update && preg_match('~^CURRENT_TIMESTAMP~i', $field["on_update"])
-					? "now"
-					: ($value === false ? null : ($value !== null ? '' : 'NULL'))
-				)
-			);
-			if (!$_POST && !$update && $value == $field["default"] && preg_match('~^[\w.]+\(~', $value)) {
-				$function = "SQL";
-			}
-			if (preg_match("~time~", $field["type"]) && preg_match('~^CURRENT_TIMESTAMP~i', $value)) {
-				$value = "";
-				$function = "now";
-			}
-			if ($field["type"] == "uuid" && $value == "uuid()") {
-				$value = "";
-				$function = "uuid";
-			}
-			if ($autofocus !== false) {
-				$autofocus = ($field["auto_increment"] || $function == "now" || $function == "uuid" ? null : true); // null - don't autofocus this input but check the next one
-			}
-			input($field, $value, $function, $autofocus);
-			if ($autofocus) {
-				$autofocus = false;
+			if (($update && !isset($field["privileges"]["update"])) || $field["generated"]) {
+				echo "<td class='function'><td>" . select_value($value, '', $field, null);
+			} else {
+				$editable = true;
+				$function = ($_POST["save"]
+					? idx($_POST["function"], $name, "")
+					: ($update && preg_match('~^CURRENT_TIMESTAMP~i', $field["on_update"])
+						? "now"
+						: ($value === false ? null : ($value !== null ? '' : 'NULL'))
+					)
+				);
+				if (!$_POST && !$update && $value == $field["default"] && preg_match('~^[\w.]+\(~', $value)) {
+					$function = "SQL";
+				}
+				if (preg_match("~time~", $field["type"]) && preg_match('~^CURRENT_TIMESTAMP~i', $value)) {
+					$value = "";
+					$function = "now";
+				}
+				if ($field["type"] == "uuid" && $value == "uuid()") {
+					$value = "";
+					$function = "uuid";
+				}
+				if ($autofocus !== false) {
+					$autofocus = ($field["auto_increment"] || $function == "now" || $function == "uuid" ? null : true); // null - don't autofocus this input but check the next one
+				}
+				input($field, $value, $function, $autofocus);
+				if ($autofocus) {
+					$autofocus = false;
+				}
 			}
 			echo "\n";
 		}
@@ -1396,7 +1416,7 @@ function edit_form($table, array $fields, $row, $update, $error = '') {
 		echo "</table>\n";
 	}
 	echo "<p>\n";
-	if ($fields) {
+	if ($editable) {
 		echo "<input type='submit' value='" . lang(16) . "'>\n";
 		if (!isset($_GET["select"])) {
 			echo "<input type='submit' name='insert' value='" . ($update
@@ -1447,32 +1467,22 @@ if (substr(VERSION, -4) != '-dev') {
 
 if ($_GET["file"] == "default.css") {
 	header("Content-Type: text/css; charset=utf-8");
-	echo "/** @author Ondrej Valka, http://valka.info */\n\nhtml {\n\t--bg: #fff;\n\t--fg: #000;\n\t--dim: #eee;\n\t--lit: #ddf;\n}\n\nbody { color: var(--fg); background: var(--bg); font: 90%/1.25 Verdana, Arial, Helvetica, sans-serif; margin: 0; min-width: fit-content; }\na { color: blue; text-decoration: none; }\na:visited { color: navy; }\na:link:hover, a:visited:hover { color: red; text-decoration: underline; }\na.text:hover { text-decoration: none; }\na.jush-help:hover { color: inherit; }\nh1 { font-size: 150%; margin: 0; padding: .8em .667em; border-bottom: 1px solid #999; font-weight: normal; color: #777; background: var(--dim); }\nh2 { font-size: 150%; margin: 0 0 20px -18px; padding: .8em 1em; border-bottom: 1px solid var(--fg); font-weight: normal; background: var(--lit); }\nh3 { font-weight: normal; font-size: 130%; margin: 1em 0 0; }\nform { margin: 0; }\ntd table { width: 100%; margin: 0; }\ntable { margin: 1em 20px 0 0; font-size: 90%; border-spacing: 0; border-width: 1px 0 0 1px; }\ntable, td, th, .js .column { border-color: #999; border-style: solid; }\ntd, th { border-width: 0 1px 1px 0; padding: .2em .3em; margin: 0; }\nth { background: var(--dim); text-align: left; }\nthead { position: sticky; top: 0; }\nthead th { text-align: center; padding: .2em .5em; }\nthead td, thead th { background: var(--lit); }\nfieldset { display: inline; vertical-align: top; padding: .5em .8em; margin: .8em .5em 0 0; border: 1px solid #999; border-radius: 5px; }\np { margin: .8em 20px 0 0; }\nimg { vertical-align: middle; border: 0; }\ntd img { max-width: 200px; max-height: 200px; }\ntbody tr:hover td, tbody tr:hover th { background: var(--dim); }\ncode { font-size: 110%; padding: 1px 2px; background: var(--dim); }\npre { margin: 1em 0 0; }\ntd pre { margin: 0; }\npre, textarea { font: 110%/1.25 monospace; }\npre.jush { background: var(--bg); }\npre code { display: block; font-size: 100%; }\ninput, textarea { box-sizing: border-box; }\ninput, select { vertical-align: middle; }\ninput[type=\"radio\"] { vertical-align: text-bottom; }\ninput.default { box-shadow: 1px 1px 1px #777; }\ninput.required, input.maxlength { box-shadow: 1px 1px 1px red; }\ninput.wayoff { left: -1000px; position: absolute; }\n.block { display: block; }\n.version { color: #777; font-size: 62%; }\n.js .hidden, .nojs .jsonly { display: none; }\n.js .column { position: absolute; background: var(--lit); padding: .27em 1ex .33em 0; margin-top: -.37em; border-width: 1px 1px 1px 0; border-radius: 0 8px 8px 0; }\n.nowrap td, .nowrap th, td.nowrap, p.nowrap { white-space: pre; }\n.wrap td { white-space: normal; }\n.error { color: red; background: #fee; }\n.error b { background: var(--bg); font-weight: normal; }\n.message { color: green; background: #efe; }\n.message table { color: var(--fg); background: var(--bg); }\n.error, .message { padding: .5em .8em; margin: 1em 20px 0 0; }\n.char { color: #007F00; }\n.date { color: #7F007F; }\n.enum { color: #007F7F; }\n.binary { color: red; }\n.odds tbody tr:nth-child(2n) { background: #F5F5F5; }\n.js .checkable .checked td, .js .checkable .checked th { background: var(--lit); }\n.time { color: silver; font-size: 70%; }\n.function, .number, .datetime { text-align: right; }\n.type { width: 15ex; }\n.options select, .options input { width: 20ex; }\n.view { font-style: italic; }\n.active { font-weight: bold; }\n.sqlarea { width: 98%; }\n.sql-footer { margin-bottom: 2.5em; }\n.explain table { white-space: pre; }\n.icon { width: 18px; height: 18px; background: navy center no-repeat; border: 0; padding: 0; vertical-align: middle; }\n.icon span { display: none; }\n.icon:hover { background-color: red; }\n.size { width: 7ex; }\n.help { cursor: help; }\n.footer { position: sticky; bottom: 0; margin: 23px -20px .5em 0; box-shadow: 0 -5px 10px 10px var(--bg); }\n.footer > div { background: var(--bg); padding: 0 0 .5em; }\n.footer fieldset { margin-top: 0; }\n.links a { white-space: nowrap; margin-right: 20px; }\n.logout { margin-top: .5em; position: absolute; top: 0; right: 0; background-color: var(--bg); box-shadow: 0 0 5px 5px var(--bg); }\n.loadmore { margin-left: 1ex; }\n/* .edit used in designs */\n#menu { position: absolute; margin: 10px 0 0; top: 2em; left: 0; width: 19em; }\n#menu p, #logins, #tables { padding: .8em 1em; margin: 0; border-bottom: 1px solid #ccc; }\n#logins li, #tables li { list-style: none; }\n#dbs { overflow: hidden; }\n#logins, #tables { white-space: nowrap; overflow: hidden; }\n#logins a, #tables a, #tables span { background: var(--bg); }\n#content { margin: 2em 0 0 21em; padding: 10px 20px 20px 0; }\n#lang { position: absolute; top: -2.6em; left: 0; padding: .3em 1em; }\n#menuopen { display: none; }\n#breadcrumb { white-space: nowrap; position: absolute; top: 0; left: 21em; background: var(--dim); height: 2em; line-height: 1.8em; padding: 0 1em; margin: 0 0 0 -18px; }\n#logo { vertical-align: baseline; margin-bottom: -3px; }\n#h1 { color: #777; text-decoration: none; font-style: italic; }\n#version { color: red; }\n#schema { margin-left: 60px; position: relative; user-select: none; -webkit-user-select: none; }\n#schema .table { border: 1px solid silver; padding: 0 2px; cursor: move; position: absolute; }\n#schema .references { position: absolute; }\n#help { position: absolute; border: 1px solid #999; background: var(--dim); padding: 5px; font-family: monospace; z-index: 1; }\n:target { background: var(--lit); }\n\n/* inlined here and not in compile.php because otherwise the development version flickers a little bit when loading the images */\n.icon-up { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIghI+py+0PTQhRTgrvfRP0nmEVOIoReZphxbauAMfyHBcAOw==); }\n.icon-down { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIghI+py+0PTQjxzCopvltX/lyix0wm2ZwdxraVAMfyHBcAOw==); }\n.icon-plus { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIhhI+py+0PTQjxzCopvm/6rykgCHGVGaFliLXuI8TyTMsFADs=); }\n.icon-cross { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIjhI+py+0PIwph1kZvfnnDLoFfd2GU4THnsUruC0fCTNc2XQAAOw==); }\n.icon-move { background-image: url(data:image/gif;base64,R0lGODlhEgASAJEAAO7u7gAAAJmZmQAAACH5BAEAAAEALAAAAAASABIAAAIfhI+py+3vgpyU0Rug3gnX5U3cqIWSZZLqigjuC8dvAQA7); }\n#schema .arrow { height: 1.25em; background: url(data:image/gif;base64,R0lGODlhCAAKAIAAAICAgP///yH5BAEAAAEALAAAAAAIAAoAAAIPBIJplrGLnpQRqtOy3rsAADs=) no-repeat right center; }\n\n.rtl h2 { margin: 0 -18px 20px 0; }\n.rtl p, .rtl table, .rtl .error, .rtl .message { margin: 1em 0 0 20px; }\n.rtl .logout { left: 0; right: auto; }\n.rtl #content { margin: 2em 21em 0 0; padding: 10px 0 20px 20px; }\n.rtl #breadcrumb { left: auto; right: 21em; margin: 0 -18px 0 0; }\n.rtl .pages { left: auto; right: 21em; }\n.rtl input.wayoff { left: auto; right: -1000px; }\n.rtl #lang, .rtl #menu { left: auto; right: 0; }\n.rtl pre, .rtl code { direction: ltr; }\n\n@media all and (max-width: 800px) {\n\t.pages { left: auto; }\n\t.js .logout { top: 1.667em; background-color: var(--dim); box-shadow: 0 0 5px 5px var(--dim); }\n\t#menu { position: static; width: auto; min-width: 23em; background: var(--bg); border: 1px solid var(--fg); margin-top: 9px; box-shadow: 0 0 20px -3px var(--fg); }\n\t#content { margin-left: 10px !important; }\n\t#lang { position: static; }\n\t#breadcrumb { left: 48px !important; }\n\t.js #foot { position: absolute; top: 2em; left: 0; }\n\t.js .foot { display: none; }\n\t.js #menuopen { display: block; position: absolute; top: 3px; left: 6px; }\n\t.nojs #menu { position: static; }\n\t.rtl.js #foot { left: auto; right: 0; }\n\t.rtl .pages { right: auto; }\n\t.rtl.js #menuopen { left: auto; right: 6px; }\n\t.rtl #content { margin-left: 0 !important; margin-right: 10px; }\n\t.rtl #breadcrumb { left: auto !important; right: 48px; }\n}\n\n@media print {\n\t#lang, #menu, .logout { display: none; }\n\t#content { margin-left: 1em; }\n\t#breadcrumb { left: 1em; }\n\t.rtl #content { margin-left: auto; margin-right: 1em; }\n\t.rtl #breadcrumb { left: auto; right: 1em; }\n\t.nowrap td, .nowrap th, td.nowrap { white-space: normal; }\n}\n.jush {\n\t--text-color: #000;\n\t--bg-color: #fff;\n\t--php-color: #003;\n\t--string-color: green;\n\t--string-plain-color: #009F00;\n\t--keyword-color: navy;\n\t--identifier-color: red;\n\t--value-color: purple;\n\t--number-color: #007F7F;\n\t--attribute-color: teal;\n\t--js-bg-color: #f0f0ff;\n\t--css-bg-color: #ffffe0;\n\t--php-bg-color: #fff0f0;\n\t--php-sql-bg-color: #ffbbb0;\n}\n\n.jush { color: var(--text-color); white-space: pre; }\n.jush-htm_com, .jush-com, .jush-com_code, .jush-one, .jush-php_doc, .jush-php_com, .jush-php_one, .jush-js_one, .jush-js_doc { color: gray; }\n.jush-php, .jush-php_new, .jush-php_fun { color: var(--php-color); background-color: var(--php-bg-color); }\n.jush-php_quo, .jush-php_eot, .jush-js_bac { color: var(--string-color); }\n.jush-php_apo, .jush-quo, .jush-quo_one, .jush-apo, .jush-sql_apo, .jush-sqlite_apo, .jush-sql_quo, .jush-sql_eot { color: var(--string-plain-color); }\n.jush-php_quo_var, .jush-php_var, .jush-sql_var, .jush-js_bac .jush-js { font-style: italic; }\n.jush-php_apo .jush-php_quo_var, .jush-php_apo .jush-php_var { font-style: normal; }\n.jush-php_halt2 { background-color: var(--bg-color); color: var(--text-color); }\n.jush-tag_css, .jush-att_css .jush-att_quo, .jush-att_css .jush-att_apo, .jush-att_css .jush-att_val { color: var(--text-color); background-color: var(--css-bg-color); }\n.jush-tag_js, .jush-att_js .jush-att_quo, .jush-att_js .jush-att_apo, .jush-att_js .jush-att_val, .jush-css_js { color: var(--text-color); background-color: var(--js-bg-color); }\n.jush-tag, .jush-xml_tag { color: var(--keyword-color); }\n.jush-att, .jush-xml_att, .jush-att_js, .jush-att_css, .jush-att_http { color: var(--attribute-color); }\n.jush-att_quo, .jush-att_apo, .jush-att_val { color: var(--value-color); }\n.jush-ent { color: var(--value-color); }\n.jush-js_key, .jush-js_key .jush-quo, .jush-js_key .jush-apo { color: var(--value-color); }\n.jush-js_reg { color: var(--keyword-color); }\n.jush-php_sql .jush-php_quo, .jush-php_sql .jush-php_apo,\n.jush-php_sqlite .jush-php_quo, .jush-php_sqlite .jush-php_apo,\n.jush-php_pgsql .jush-php_quo, .jush-php_pgsql .jush-php_apo,\n.jush-php_mssql .jush-php_quo, .jush-php_mssql .jush-php_apo,\n.jush-php_oracle .jush-php_quo, .jush-php_oracle .jush-php_apo { background-color: var(--php-sql-bg-color); }\n.jush-bac, .jush-php_bac, .jush-bra, .jush-mssql_bra, .jush-sqlite_quo { color: var(--identifier-color); }\n.jush-num, .jush-clr { color: var(--number-color); }\n\n.jush a { color: var(--keyword-color); }\n.jush a.jush-help { cursor: help; }\n.jush-sql a, .jush-sql_code a, .jush-sqlite a, .jush-pgsql a, .jush-mssql a, .jush-oracle a, .jush-simpledb a { font-weight: bold; }\n.jush-php_sql .jush-php_quo a, .jush-php_sql .jush-php_apo a { font-weight: normal; }\n.jush-tag a, .jush-att a, .jush-apo a, .jush-quo a, .jush-php_apo a, .jush-php_quo a, .jush-php_eot2 a { color: inherit; }\na.jush-custom:link, a.jush-custom:visited { font-weight: normal; color: inherit; }\n\n.jush p { margin: 0; }\n";
+	echo "/** @author Ondrej Valka, http://valka.info */\n\nhtml {\n\t--bg: #fff;\n\t--fg: #000;\n\t--dim: #eee;\n\t--lit: #ddf;\n}\n\nbody { color: var(--fg); background: var(--bg); font: 90%/1.25 Verdana, Arial, Helvetica, sans-serif; margin: 0; min-width: fit-content; }\na { color: blue; text-decoration: none; }\na:visited { color: navy; }\na:link:hover, a:visited:hover { color: red; text-decoration: underline; }\na.text:hover { text-decoration: none; }\na.jush-help:hover { color: inherit; }\nh1 { font-size: 150%; margin: 0; padding: .8em .667em; border-bottom: 1px solid #999; font-weight: normal; color: #777; background: var(--dim); }\nh2 { font-size: 150%; margin: 0 0 20px -18px; padding: .8em 1em; border-bottom: 1px solid var(--fg); font-weight: normal; background: var(--lit); }\nh3 { font-weight: normal; font-size: 130%; margin: 1em 0 0; }\nform { margin: 0; }\ntd table { width: 100%; margin: 0; }\ntable { margin: 1em 20px 0 0; font-size: 90%; border-spacing: 0; border-width: 1px 0 0 1px; }\ntable, td, th, .js .column { border-color: #999; border-style: solid; }\ntd, th { border-width: 0 1px 1px 0; padding: .2em .3em; margin: 0; }\nth { background: var(--dim); text-align: left; }\nthead { position: sticky; top: 0; }\nthead th { text-align: center; padding: .2em .5em; }\nthead td, thead th { background: var(--lit); }\nfieldset { display: inline; vertical-align: top; padding: .5em .8em; margin: .8em .5em 0 0; border: 1px solid #999; border-radius: 5px; }\np { margin: .8em 20px 0 0; }\nimg { vertical-align: middle; border: 0; }\ntd img { max-width: 200px; max-height: 200px; }\ntbody tr:hover td, tbody tr:hover th { background: var(--dim); }\ncode { font-size: 110%; padding: 1px 2px; background: var(--dim); }\npre { margin: 1em 0 0; }\ntd pre { margin: 0; }\npre, textarea { font: 110%/1.25 monospace; }\npre.jush { background: var(--bg); }\npre code { display: block; font-size: 100%; }\ninput, textarea { box-sizing: border-box; }\ninput, select { vertical-align: middle; }\ninput[type=\"radio\"] { vertical-align: text-bottom; }\ninput.default { box-shadow: 1px 1px 1px #777; }\ninput.required, input.maxlength { box-shadow: 1px 1px 1px red; }\ninput.wayoff { left: -1000px; position: absolute; }\n.block { display: block; }\n.version { color: #777; font-size: 62%; }\n.js .hidden, .nojs .jsonly { display: none; }\n.js .column { position: absolute; background: var(--lit); padding: .27em 1ex .33em 0; margin-top: -.37em; border-width: 1px 1px 1px 0; border-radius: 0 8px 8px 0; }\n.nowrap td, .nowrap th, td.nowrap, p.nowrap { white-space: pre; }\n.wrap td { white-space: normal; }\n.error { color: red; background: #fee; }\n.error b { background: var(--bg); font-weight: normal; }\n.message { color: green; background: #efe; }\n.message table { color: var(--fg); background: var(--bg); }\n.error, .message { padding: .5em .8em; margin: 1em 20px 0 0; }\n.char { color: #007F00; }\n.date { color: #7F007F; }\n.enum { color: #007F7F; }\n.binary { color: red; }\n.odds tbody tr { background: var(--bg); }\n.odds tbody tr:nth-child(2n) { background: #F5F5F5; }\n.js .checkable .checked td, .js .checkable .checked th { background: var(--lit); }\n.time { color: silver; font-size: 70%; }\n.function, .number, .datetime { text-align: right; }\n.type { width: 15ex; }\n.options select, .options input { width: 20ex; }\n.view { font-style: italic; }\n.active { font-weight: bold; }\n.sqlarea { width: 98%; }\n.sql-footer { margin-bottom: 2.5em; }\n.explain table { white-space: pre; }\n.icon { width: 18px; height: 18px; background: navy center no-repeat; border: 0; padding: 0; vertical-align: middle; }\n.icon span { display: none; }\n.icon:hover { background-color: red; }\n.size { width: 7ex; }\n.help { cursor: help; }\n.footer { position: sticky; bottom: 0; margin: 23px -20px .5em 0; box-shadow: 0 -5px 10px 10px var(--bg); }\n.footer > div { background: var(--bg); padding: 0 0 .5em; }\n.footer fieldset { margin-top: 0; }\n.links a { white-space: nowrap; margin-right: 20px; }\n.logout { margin-top: .5em; position: absolute; top: 0; right: 0; background-color: var(--bg); box-shadow: 0 0 5px 5px var(--bg); }\n.loadmore { margin-left: 1ex; }\n/* .edit used in designs */\n#menu { position: absolute; margin: 10px 0 0; top: 2em; left: 0; width: 19em; }\n#menu p, #logins, #tables { padding: .8em 1em; margin: 0; border-bottom: 1px solid #ccc; }\n#logins li, #tables li { list-style: none; }\n#dbs { overflow: hidden; }\n#logins, #tables { white-space: nowrap; overflow: hidden; }\n#logins a, #tables a, #tables span { background: var(--bg); }\n#content { margin: 2em 0 0 21em; padding: 10px 20px 20px 0; }\n#lang { position: absolute; top: -2.6em; left: 0; padding: .3em 1em; }\n#menuopen { display: none; }\n#breadcrumb { white-space: nowrap; position: absolute; top: 0; left: 21em; background: var(--dim); height: 2em; line-height: 1.8em; padding: 0 1em; margin: 0 0 0 -18px; }\n#logo { vertical-align: baseline; margin-bottom: -3px; }\n#h1 { color: #777; text-decoration: none; font-style: italic; }\n#version { color: red; }\n#schema { margin-left: 60px; position: relative; user-select: none; -webkit-user-select: none; }\n#schema .table { border: 1px solid silver; padding: 0 2px; cursor: move; position: absolute; }\n#schema .references { position: absolute; }\n#help { position: absolute; border: 1px solid #999; background: var(--dim); padding: 5px; font-family: monospace; z-index: 1; }\n:target { background: var(--lit); }\n\n/* inlined here and not in compile.php because otherwise the development version flickers a little bit when loading the images */\n.icon-up { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIghI+py+0PTQhRTgrvfRP0nmEVOIoReZphxbauAMfyHBcAOw==); }\n.icon-down { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIghI+py+0PTQjxzCopvltX/lyix0wm2ZwdxraVAMfyHBcAOw==); }\n.icon-plus { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIhhI+py+0PTQjxzCopvm/6rykgCHGVGaFliLXuI8TyTMsFADs=); }\n.icon-cross { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIjhI+py+0PIwph1kZvfnnDLoFfd2GU4THnsUruC0fCTNc2XQAAOw==); }\n.icon-move { background-image: url(data:image/gif;base64,R0lGODlhEgASAJEAAO7u7gAAAJmZmQAAACH5BAEAAAEALAAAAAASABIAAAIfhI+py+3vgpyU0Rug3gnX5U3cqIWSZZLqigjuC8dvAQA7); }\n#schema .arrow { height: 1.25em; background: url(data:image/gif;base64,R0lGODlhCAAKAIAAAICAgP///yH5BAEAAAEALAAAAAAIAAoAAAIPBIJplrGLnpQRqtOy3rsAADs=) no-repeat right center; }\n\n.rtl h2 { margin: 0 -18px 20px 0; }\n.rtl p, .rtl table, .rtl .error, .rtl .message { margin: 1em 0 0 20px; }\n.rtl .logout { left: 0; right: auto; }\n.rtl #content { margin: 2em 21em 0 0; padding: 10px 0 20px 20px; }\n.rtl #breadcrumb { left: auto; right: 21em; margin: 0 -18px 0 0; }\n.rtl .pages { left: auto; right: 21em; }\n.rtl input.wayoff { left: auto; right: -1000px; }\n.rtl #lang, .rtl #menu { left: auto; right: 0; }\n.rtl pre, .rtl code { direction: ltr; }\n\n@media all and (max-width: 800px) {\n\t.pages { left: auto; }\n\t.js .logout { top: 1.667em; background-color: var(--dim); box-shadow: 0 0 5px 5px var(--dim); }\n\t#menu { position: static; width: auto; min-width: 23em; background: var(--bg); border: 1px solid var(--fg); margin-top: 9px; box-shadow: 0 0 20px -3px var(--fg); }\n\t#content { margin-left: 10px !important; }\n\t#lang { position: static; }\n\t#breadcrumb { left: 48px !important; }\n\t.js #foot { position: absolute; top: 2em; left: 0; }\n\t.js .foot { display: none; }\n\t.js #menuopen { display: block; position: absolute; top: 3px; left: 6px; }\n\t.nojs #menu { position: static; }\n\t.rtl.js #foot { left: auto; right: 0; }\n\t.rtl .pages { right: auto; }\n\t.rtl.js #menuopen { left: auto; right: 6px; }\n\t.rtl #content { margin-left: 0 !important; margin-right: 10px; }\n\t.rtl #breadcrumb { left: auto !important; right: 48px; }\n}\n\n@media print {\n\t#lang, #menu, .logout { display: none; }\n\t#content { margin-left: 1em; }\n\t#breadcrumb { left: 1em; }\n\t.rtl #content { margin-left: auto; margin-right: 1em; }\n\t.rtl #breadcrumb { left: auto; right: 1em; }\n\t.nowrap td, .nowrap th, td.nowrap { white-space: normal; }\n}\n.jush {\n\t--text-color: #000;\n\t--bg-color: #fff;\n\t--php-color: #003;\n\t--string-color: green;\n\t--string-plain-color: #009F00;\n\t--keyword-color: navy;\n\t--identifier-color: red;\n\t--value-color: purple;\n\t--number-color: #007F7F;\n\t--attribute-color: teal;\n\t--js-bg-color: #f0f0ff;\n\t--css-bg-color: #ffffe0;\n\t--php-bg-color: #fff0f0;\n\t--php-sql-bg-color: #ffbbb0;\n}\n\n.jush { color: var(--text-color); white-space: pre; }\n.jush-htm_com, .jush-com, .jush-com_code, .jush-one, .jush-php_doc, .jush-php_com, .jush-php_one, .jush-js_one, .jush-js_doc { color: gray; }\n.jush-php, .jush-php_new, .jush-php_fun { color: var(--php-color); background-color: var(--php-bg-color); }\n.jush-php_quo, .jush-php_eot, .jush-js_bac { color: var(--string-color); }\n.jush-php_apo, .jush-quo, .jush-quo_one, .jush-apo, .jush-sql_apo, .jush-sqlite_apo, .jush-sql_quo, .jush-sql_eot { color: var(--string-plain-color); }\n.jush-php_quo_var, .jush-php_var, .jush-sql_var, .jush-js_bac .jush-js { font-style: italic; }\n.jush-php_apo .jush-php_quo_var, .jush-php_apo .jush-php_var { font-style: normal; }\n.jush-php_halt2 { background-color: var(--bg-color); color: var(--text-color); }\n.jush-tag_css, .jush-att_css .jush-att_quo, .jush-att_css .jush-att_apo, .jush-att_css .jush-att_val { color: var(--text-color); background-color: var(--css-bg-color); }\n.jush-tag_js, .jush-att_js .jush-att_quo, .jush-att_js .jush-att_apo, .jush-att_js .jush-att_val, .jush-css_js { color: var(--text-color); background-color: var(--js-bg-color); }\n.jush-tag, .jush-xml_tag { color: var(--keyword-color); }\n.jush-att, .jush-xml_att, .jush-att_js, .jush-att_css, .jush-att_http { color: var(--attribute-color); }\n.jush-att_quo, .jush-att_apo, .jush-att_val { color: var(--value-color); }\n.jush-ent { color: var(--value-color); }\n.jush-js_key, .jush-js_key .jush-quo, .jush-js_key .jush-apo { color: var(--value-color); }\n.jush-js_reg { color: var(--keyword-color); }\n.jush-php_sql .jush-php_quo, .jush-php_sql .jush-php_apo,\n.jush-php_sqlite .jush-php_quo, .jush-php_sqlite .jush-php_apo,\n.jush-php_pgsql .jush-php_quo, .jush-php_pgsql .jush-php_apo,\n.jush-php_mssql .jush-php_quo, .jush-php_mssql .jush-php_apo,\n.jush-php_oracle .jush-php_quo, .jush-php_oracle .jush-php_apo { background-color: var(--php-sql-bg-color); }\n.jush-bac, .jush-php_bac, .jush-bra, .jush-mssql_bra, .jush-sqlite_quo { color: var(--identifier-color); }\n.jush-num, .jush-clr { color: var(--number-color); }\n\n.jush a { color: var(--keyword-color); }\n.jush a.jush-help { cursor: help; }\n.jush-sql a, .jush-sql_code a, .jush-sqlite a, .jush-pgsql a, .jush-mssql a, .jush-oracle a, .jush-simpledb a, .jush-igdb a { font-weight: bold; }\n.jush-php_sql .jush-php_quo a, .jush-php_sql .jush-php_apo a { font-weight: normal; }\n.jush-tag a, .jush-att a, .jush-apo a, .jush-quo a, .jush-php_apo a, .jush-php_quo a, .jush-php_eot2 a { color: inherit; }\na.jush-custom:link, a.jush-custom:visited { font-weight: normal; color: inherit; }\n\n.jush p { margin: 0; }\n";
 } elseif ($_GET["file"] == "dark.css") {
 	header("Content-Type: text/css; charset=utf-8");
 	echo "/** @author Robert Mesaros, https://www.rmsoft.sk */\n\nhtml {\n\t--bg: #002240;\n\t--fg: #829bb0;\n\t--dim: #154269;\n\t--lit: #011d35;\n}\n\na, a:visited { color: #618cb3; }\na:link:hover, a:visited:hover { color: #9bc0e1; }\nh1 { border-color: #5e94c1; color: #ffddbf; }\nh2 { border-color: #a3bdd3; color: #000; background: #3c678d; }\ntable, td, th, .js .column { border-color: #0e416d; }\nth { background: #11385a; }\nthead td, thead th, thead th a { color: #a8b05f; }\nfieldset { border-color: #16548a; }\ncode { background: #11385a; }\ntbody tr:hover td, tbody tr:hover th { background: #133553; }\npre.jush { background: #11385a; }\ninput.default { box-shadow: 1px 1px 1px #888; }\ninput.required, input.maxlength { box-shadow: 1px 1px 1px red; }\n.version { color: #888; }\n.error { color: red; background: #efdada; border: 1px solid #e76f6f; }\n.error b { background: #efeaea; }\n.message { color: #0b860b; background: #efe; border: 1px solid #7fbd7f; }\n.char { color: #a949a9; }\n.date { color: #59c159; }\n.enum { color: #d55c5c; }\n.binary { color: #9bc0e1; }\n.odds tbody tr:nth-child(2n) { background: #042541; }\n.js .checkable .checked td, .js .checkable .checked th { background: #10395c; color: #67a4a5; }\n.js .checkable .checked:hover td, .js .checkable .checked:hover th { background: #133553; }\n.js .checkable .checked a { color: #67a4a5; }\n.icon { filter: invert(1); background-color: #062642; }\n.icon:hover { background-color: #d1394e; }\n#menu { border-color: #a3bdd3; }\n#menu p, #logins, #tables { border-color: #326b9c; }\n#h1 { color: #ffddbf; }\n#version { color: #d2b397; }\n#schema .table { border-color: #093459; }\n#help { border-color: #666; background: #c7e4fe; }\n#schema div.table a { color: #3c7bb3; }\n#menu .active { color: #398c8d; }\n#edit-fields tbody tr:hover td, #edit-fields tbody tr:hover th { background: #3b6f9d; }\n:target { color: #a8b05f; }\n.jush {\n\t--text-color: #ccc;\n\t--bg-color: #111;\n\t--php-color: #cc9;\n\t--string-color: #e6e;\n\t--string-plain-color: #e6e;\n\t--keyword-color: #acf;\n\t--identifier-color: #f88;\n\t--value-color: #e6e;\n\t--number-color: #0c0;\n\t--attribute-color: #3cc;\n\t--js-bg-color: #036;\n\t--css-bg-color: #404000;\n\t--php-bg-color: #520;\n\t--php-sql-bg-color: #404000;\n}\n";
 } elseif ($_GET["file"] == "functions.js") {
 	header("Content-Type: text/javascript; charset=utf-8");
-	echo "'use strict';\n\n/** Get first element by selector\n* @param string\n* @param [HTMLElement] defaults to document\n* @return HTMLElement\n*/\nfunction qs(selector, context) {\n\treturn (context || document).querySelector(selector);\n}\n\n/** Get last element by selector\n* @param string\n* @param [HTMLElement] defaults to document\n* @return HTMLElement\n*/\nfunction qsl(selector, context) {\n\tconst els = qsa(selector, context);\n\treturn els[els.length - 1];\n}\n\n/** Get all elements by selector\n* @param string\n* @param [HTMLElement] defaults to document\n* @return NodeList\n*/\nfunction qsa(selector, context) {\n\treturn (context || document).querySelectorAll(selector);\n}\n\n/** Return a function calling fn with the next arguments\n* @param function\n* @param ...\n* @return function with preserved this\n*/\nfunction partial(fn) {\n\tconst args = Array.apply(null, arguments).slice(1);\n\treturn function () {\n\t\treturn fn.apply(this, args);\n\t};\n}\n\n/** Return a function calling fn with the first parameter and then the next arguments\n* @param function\n* @param ...\n* @return function with preserved this\n*/\nfunction partialArg(fn) {\n\tconst args = Array.apply(null, arguments);\n\treturn function (arg) {\n\t\targs[0] = arg;\n\t\treturn fn.apply(this, args);\n\t};\n}\n\n/** Assign values from source to target\n* @param Object\n* @param Object\n*/\nfunction mixin(target, source) {\n\tfor (const key in source) {\n\t\ttarget[key] = source[key];\n\t}\n}\n\n/** Add or remove CSS class\n* @param HTMLElement\n* @param string\n* @param [boolean]\n*/\nfunction alterClass(el, className, enable) {\n\tif (el) {\n\t\tel.classList[enable ? 'add' : 'remove'](className);\n\t}\n}\n\n/** Toggle visibility\n* @param string\n* @return boolean false\n*/\nfunction toggle(id) {\n\tconst el = qs('#' + id);\n\tel && el.classList.toggle('hidden');\n\treturn false;\n}\n\n/** Set permanent cookie\n* @param string\n* @param number\n*/\nfunction cookie(assign, days) {\n\tconst date = new Date();\n\tdate.setDate(date.getDate() + days);\n\tdocument.cookie = assign + '; expires=' + date;\n}\n\n/** Verify current Adminer version\n* @param string\n* @param string own URL base\n* @param string\n*/\nfunction verifyVersion(current, url, token) {\n\tcookie('adminer_version=0', 1);\n\tconst iframe = document.createElement('iframe');\n\tiframe.src = 'https://www.adminer.org/version/?current=' + current;\n\tiframe.frameBorder = 0;\n\tiframe.marginHeight = 0;\n\tiframe.scrolling = 'no';\n\tiframe.style.width = '7ex';\n\tiframe.style.height = '1.25em';\n\tiframe.style.display = 'none';\n\taddEventListener('message', event => {\n\t\tif (event.origin == 'https://www.adminer.org') {\n\t\t\tconst match = /version=(.+)/.exec(event.data);\n\t\t\tif (match) {\n\t\t\t\tcookie('adminer_version=' + match[1], 1);\n\t\t\t\tajax(url + 'script=version', () => { }, event.data + '&token=' + token);\n\t\t\t}\n\t\t}\n\t}, false);\n\tqs('#version').appendChild(iframe);\n}\n\n/** Get value of select\n* @param HTMLElement <select> or <input>\n* @return string\n*/\nfunction selectValue(select) {\n\tif (!select.selectedIndex) {\n\t\treturn select.value;\n\t}\n\tconst selected = select.options[select.selectedIndex];\n\treturn ((selected.attributes.value || {}).specified ? selected.value : selected.text);\n}\n\n/** Verify if element has a specified tag name\n* @param HTMLElement\n* @param string regular expression\n* @return boolean\n*/\nfunction isTag(el, tag) {\n\tconst re = new RegExp('^(' + tag + ')\$', 'i');\n\treturn el && re.test(el.tagName);\n}\n\n/** Get parent node with specified tag name\n* @param HTMLElement\n* @param string regular expression\n* @return HTMLElement\n*/\nfunction parentTag(el, tag) {\n\twhile (el && !isTag(el, tag)) {\n\t\tel = el.parentNode;\n\t}\n\treturn el;\n}\n\n/** Set checked class\n* @param HTMLInputElement\n*/\nfunction trCheck(el) {\n\tconst tr = parentTag(el, 'tr');\n\talterClass(tr, 'checked', el.checked);\n\tif (el.form && el.form['all'] && el.form['all'].onclick) { // Opera treats form.all as document.all\n\t\tel.form['all'].onclick();\n\t}\n}\n\n/** Fill number of selected items\n* @param string\n* @param string\n* @uses thousandsSeparator\n*/\nfunction selectCount(id, count) {\n\tsetHtml(id, (count === '' ? '' : '(' + (count + '').replace(/\\B(?=(\\d{3})+\$)/g, thousandsSeparator) + ')'));\n\tconst el = qs('#' + id);\n\tif (el) {\n\t\tfor (const input of qsa('input', el.parentNode.parentNode)) {\n\t\t\tif (input.type == 'submit') {\n\t\t\t\tinput.disabled = (count == '0');\n\t\t\t}\n\t\t}\n\t}\n}\n\n/** Check all elements matching given name\n* @param RegExp\n* @this HTMLInputElement\n*/\nfunction formCheck(name) {\n\tfor (const elem of this.form.elements) {\n\t\tif (name.test(elem.name)) {\n\t\t\telem.checked = this.checked;\n\t\t\ttrCheck(elem);\n\t\t}\n\t}\n}\n\n/** Check all rows in <table class=\"checkable\">\n*/\nfunction tableCheck() {\n\tfor (const input of qsa('table.checkable td:first-child input')) {\n\t\ttrCheck(input);\n\t}\n}\n\n/** Uncheck single element\n* @param string\n*/\nfunction formUncheck(id) {\n\tconst el = qs('#' + id);\n\tel.checked = false;\n\ttrCheck(el);\n}\n\n/** Get number of checked elements matching given name\n* @param HTMLInputElement\n* @param RegExp\n* @return number\n*/\nfunction formChecked(input, name) {\n\tlet checked = 0;\n\tfor (const el of input.form.elements) {\n\t\tif (name.test(el.name) && el.checked) {\n\t\t\tchecked++;\n\t\t}\n\t}\n\treturn checked;\n}\n\n/** Select clicked row\n* @param MouseEvent\n* @param [boolean] force click\n*/\nfunction tableClick(event, click) {\n\tconst td = parentTag(event.target, 'td');\n\tlet text;\n\tif (td && (text = td.dataset.text)) {\n\t\tif (selectClick.call(td, event, +text, td.dataset.warning)) {\n\t\t\treturn;\n\t\t}\n\t}\n\tclick = (click || !window.getSelection || getSelection().isCollapsed);\n\tlet el = event.target;\n\twhile (!isTag(el, 'tr')) {\n\t\tif (isTag(el, 'table|a|input|textarea')) {\n\t\t\tif (el.type != 'checkbox') {\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tcheckboxClick.call(el, event);\n\t\t\tclick = false;\n\t\t}\n\t\tel = el.parentNode;\n\t\tif (!el) { // Ctrl+click on text fields hides the element\n\t\t\treturn;\n\t\t}\n\t}\n\tel = el.firstChild.firstChild;\n\tif (click) {\n\t\tel.checked = !el.checked;\n\t\tel.onclick && el.onclick();\n\t}\n\tif (el.name == 'check[]') {\n\t\tel.form['all'].checked = false;\n\t\tformUncheck('all-page');\n\t}\n\tif (/^(tables|views)\\[\\]\$/.test(el.name)) {\n\t\tformUncheck('check-all');\n\t}\n\ttrCheck(el);\n}\n\nlet lastChecked;\n\n/** Shift-click on checkbox for multiple selection.\n* @param MouseEvent\n* @this HTMLInputElement\n*/\nfunction checkboxClick(event) {\n\tif (!this.name) {\n\t\treturn;\n\t}\n\tif (event.shiftKey && (!lastChecked || lastChecked.name == this.name)) {\n\t\tconst checked = (lastChecked ? lastChecked.checked : true);\n\t\tlet checking = !lastChecked;\n\t\tfor (const input of qsa('input', parentTag(this, 'table'))) {\n\t\t\tif (input.name === this.name) {\n\t\t\t\tif (checking) {\n\t\t\t\t\tinput.checked = checked;\n\t\t\t\t\ttrCheck(input);\n\t\t\t\t}\n\t\t\t\tif (input === this || input === lastChecked) {\n\t\t\t\t\tif (checking) {\n\t\t\t\t\t\tbreak;\n\t\t\t\t\t}\n\t\t\t\t\tchecking = true;\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t} else {\n\t\tlastChecked = this;\n\t}\n}\n\n/** Set HTML code of an element\n* @param string\n* @param string undefined to set parentNode to empty string\n*/\nfunction setHtml(id, html) {\n\tconst el = qs('[id=\"' + id.replace(/[\\\\\"]/g, '\\\\\$&') + '\"]'); // database name is used as ID\n\tif (el) {\n\t\tif (html == null) {\n\t\t\tel.parentNode.innerHTML = '';\n\t\t} else {\n\t\t\tel.innerHTML = html;\n\t\t}\n\t}\n}\n\n/** Find node position\n* @param Node\n* @return number\n*/\nfunction nodePosition(el) {\n\tlet pos = 0;\n\twhile ((el = el.previousSibling)) {\n\t\tpos++;\n\t}\n\treturn pos;\n}\n\n/** Go to the specified page\n* @param string\n* @param string\n*/\nfunction pageClick(href, page) {\n\tif (!isNaN(page) && page) {\n\t\tlocation.href = href + (page != 1 ? '&page=' + (page - 1) : '');\n\t}\n}\n\n\n\n/** Display items in menu\n* @param MouseEvent\n* @this HTMLElement\n*/\nfunction menuOver(event) {\n\tconst a = event.target;\n\tif (isTag(a, 'a|span') && a.offsetLeft + a.offsetWidth > a.parentNode.offsetWidth - 15) { // 15 - ellipsis\n\t\tthis.style.overflow = 'visible';\n\t}\n}\n\n/** Hide items in menu\n* @this HTMLElement\n*/\nfunction menuOut() {\n\tthis.style.overflow = 'hidden';\n}\n\n\n\n/** Add row in select fieldset\n* @this HTMLSelectElement\n*/\nfunction selectAddRow() {\n\tconst field = this;\n\tconst row = cloneNode(field.parentNode);\n\tfield.onchange = selectFieldChange;\n\tfield.onchange();\n\tfor (const select of qsa('select', row)) {\n\t\tselect.name = select.name.replace(/[a-z]\\[\\d+/, '\$&1');\n\t\tselect.selectedIndex = 0;\n\t}\n\tfor (const input of qsa('input', row)) {\n\t\tinput.name = input.name.replace(/[a-z]\\[\\d+/, '\$&1');\n\t\tinput.className = '';\n\t\tif (input.type == 'checkbox') {\n\t\t\tinput.checked = false;\n\t\t} else {\n\t\t\tinput.value = '';\n\t\t}\n\t}\n\tfield.parentNode.parentNode.appendChild(row);\n}\n\n/** Prevent onsearch handler on Enter\n* @param KeyboardEvent\n* @this HTMLInputElement\n*/\nfunction selectSearchKeydown(event) {\n\tif (event.keyCode == 13 || event.keyCode == 10) {\n\t\tthis.onsearch = () => { };\n\t}\n}\n\n/** Clear column name after resetting search\n* @this HTMLInputElement\n*/\nfunction selectSearchSearch() {\n\tif (!this.value) {\n\t\tthis.parentNode.firstChild.selectedIndex = 0;\n\t}\n}\n\n\n\n/** Toggle column context menu\n* @param [string] extra class name\n* @this HTMLElement\n*/\nfunction columnMouse(className) {\n\tfor (const span of qsa('span', this)) {\n\t\tif (/column/.test(span.className)) {\n\t\t\tspan.className = 'column' + (className || '');\n\t\t}\n\t}\n}\n\n\n\n/** Fill column in search field\n* @param string\n* @return boolean false\n*/\nfunction selectSearch(name) {\n\tlet el = qs('#fieldset-search');\n\tel.className = '';\n\tconst divs = qsa('div', el);\n\tlet i, div;\n\tfor (i=0; i < divs.length; i++) {\n\t\tdiv = divs[i];\n\t\tel = qs('[name\$=\"[col]\"]', div);\n\t\tif (el && selectValue(el) == name) {\n\t\t\tbreak;\n\t\t}\n\t}\n\tif (i == divs.length) {\n\t\tdiv.firstChild.value = name;\n\t\tdiv.firstChild.onchange();\n\t}\n\tqs('[name\$=\"[val]\"]', div).focus();\n\treturn false;\n}\n\n\n/** Check if Ctrl key (Command key on Mac) was pressed\n* @param KeyboardEvent|MouseEvent\n* @return boolean\n*/\nfunction isCtrl(event) {\n\treturn (event.ctrlKey || event.metaKey) && !event.altKey; // shiftKey allowed\n}\n\n\n\n/** Send form by Ctrl+Enter on <select> and <textarea>\n* @param KeyboardEvent\n* @param [string]\n* @return boolean\n*/\nfunction bodyKeydown(event, button) {\n\teventStop(event);\n\tlet target = event.target;\n\tif (target.jushTextarea) {\n\t\ttarget = target.jushTextarea;\n\t}\n\tif (isCtrl(event) && (event.keyCode == 13 || event.keyCode == 10) && isTag(target, 'select|textarea|input')) { // 13|10 - Enter\n\t\ttarget.blur();\n\t\tif (target.form[button]) {\n\t\t\ttarget.form[button].click();\n\t\t} else {\n\t\t\ttarget.form.dispatchEvent(new Event('submit', {bubbles: true}));\n\t\t\ttarget.form.submit();\n\t\t}\n\t\ttarget.focus();\n\t\treturn false;\n\t}\n\treturn true;\n}\n\n/** Open form to a new window on Ctrl+click or Shift+click\n* @param MouseEvent\n*/\nfunction bodyClick(event) {\n\tconst target = event.target;\n\tif ((isCtrl(event) || event.shiftKey) && target.type == 'submit' && isTag(target, 'input')) {\n\t\ttarget.form.target = '_blank';\n\t\tsetTimeout(() => {\n\t\t\t// if (isCtrl(event)) { focus(); } doesn't work\n\t\t\ttarget.form.target = '';\n\t\t}, 0);\n\t}\n}\n\n\n\n/** Change focus by Ctrl+Shift+Up or Ctrl+Shift+Down\n* @param KeyboardEvent\n* @return boolean\n*/\nfunction editingKeydown(event) {\n\tif ((event.keyCode == 40 || event.keyCode == 38) && isCtrl(event)) { // 40 - Down, 38 - Up\n\t\tconst target = event.target;\n\t\tconst sibling = (event.keyCode == 40 ? 'nextSibling' : 'previousSibling');\n\t\tlet el = target.parentNode.parentNode[sibling];\n\t\tif (el && (isTag(el, 'tr') || (el = el[sibling])) && isTag(el, 'tr') && (el = el.childNodes[nodePosition(target.parentNode)]) && (el = el.childNodes[nodePosition(target)])) {\n\t\t\tel.focus();\n\t\t}\n\t\treturn false;\n\t}\n\tif (event.shiftKey && !bodyKeydown(event, 'insert')) {\n\t\treturn false;\n\t}\n\treturn true;\n}\n\n/** Disable maxlength for functions\n* @this HTMLSelectElement\n*/\nfunction functionChange() {\n\tconst input = this.form[this.name.replace(/^function/, 'fields')];\n\tif (input) { // undefined with the set data type\n\t\tif (selectValue(this)) {\n\t\t\tif (input.origType === undefined) {\n\t\t\t\tinput.origType = input.type;\n\t\t\t\tinput.origMaxLength = input.dataset.maxlength;\n\t\t\t}\n\t\t\tdelete input.dataset.maxlength;\n\t\t\tinput.type = 'text';\n\t\t} else if (input.origType) {\n\t\t\tinput.type = input.origType;\n\t\t\tif (input.origMaxLength >= 0) {\n\t\t\t\tinput.dataset.maxlength = input.origMaxLength;\n\t\t\t}\n\t\t}\n\t\toninput({target: input});\n\t}\n\thelpClose();\n}\n\n/** Skip 'original' when typing\n* @param number\n* @this HTMLTableCellElement\n*/\nfunction skipOriginal(first) {\n\tconst fnSelect = qs('select', this.previousSibling);\n\tif (fnSelect.selectedIndex < first) {\n\t\tfnSelect.selectedIndex = first;\n\t}\n}\n\n/** Add new field in schema-less edit\n* @this HTMLInputElement\n*/\nfunction fieldChange() {\n\tconst row = cloneNode(parentTag(this, 'tr'));\n\tfor (const input of qsa('input', row)) {\n\t\tinput.value = '';\n\t}\n\t// keep value in <select> (function)\n\tparentTag(this, 'table').appendChild(row);\n\tthis.oninput = () => { };\n}\n\n\n\n/** Create AJAX request\n* @param string\n* @param function (XMLHttpRequest)\n* @param [string]\n* @param [string]\n* @return XMLHttpRequest or false in case of an error\n* @uses offlineMessage\n*/\nfunction ajax(url, callback, data, message) {\n\tconst request = new XMLHttpRequest();\n\tif (request) {\n\t\tconst ajaxStatus = qs('#ajaxstatus');\n\t\tif (message) {\n\t\t\tajaxStatus.innerHTML = '<div class=\"message\">' + message + '</div>';\n\t\t}\n\t\talterClass(ajaxStatus, 'hidden', !message);\n\t\trequest.open((data ? 'POST' : 'GET'), url);\n\t\tif (data) {\n\t\t\trequest.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');\n\t\t}\n\t\trequest.setRequestHeader('X-Requested-With', 'XMLHttpRequest');\n\t\trequest.onreadystatechange = () => {\n\t\t\tif (request.readyState == 4) {\n\t\t\t\tif (/^2/.test(request.status)) {\n\t\t\t\t\tcallback(request);\n\t\t\t\t} else if (message !== null) {\n\t\t\t\t\tajaxStatus.innerHTML = (request.status ? request.responseText : '<div class=\"error\">' + offlineMessage + '</div>');\n\t\t\t\t\talterClass(ajaxStatus, 'hidden');\n\t\t\t\t}\n\t\t\t}\n\t\t};\n\t\trequest.send(data);\n\t}\n\treturn request;\n}\n\n/** Use setHtml(key, value) for JSON response\n* @param string\n* @return boolean false for success\n*/\nfunction ajaxSetHtml(url) {\n\treturn !ajax(url, request => {\n\t\tconst data = JSON.parse(request.responseText);\n\t\tfor (const key in data) {\n\t\t\tsetHtml(key, data[key]);\n\t\t}\n\t});\n}\n\nlet editChanged; // used by plugins\nlet adminerHighlighter = els => {}; // overwritten by syntax highlighters\n\n/** Save form contents through AJAX\n* @param HTMLFormElement\n* @param string\n* @param [HTMLInputElement]\n* @return boolean\n*/\nfunction ajaxForm(form, message, button) {\n\tlet data = [];\n\tfor (const el of form.elements) {\n\t\tif (el.name && !el.disabled) {\n\t\t\tif (/^file\$/i.test(el.type) && el.value) {\n\t\t\t\treturn false;\n\t\t\t}\n\t\t\tif (!/^(checkbox|radio|submit|file)\$/i.test(el.type) || el.checked || el == button) {\n\t\t\t\tdata.push(encodeURIComponent(el.name) + '=' + encodeURIComponent(isTag(el, 'select') ? selectValue(el) : el.value));\n\t\t\t}\n\t\t}\n\t}\n\tdata = data.join('&');\n\n\tlet url = form.action;\n\tif (!/post/i.test(form.method)) {\n\t\turl = url.replace(/\\?.*/, '') + '?' + data;\n\t\tdata = '';\n\t}\n\treturn ajax(url, request => {\n\t\tconst ajaxstatus = qs('#ajaxstatus');\n\t\tsetHtml('ajaxstatus', request.responseText);\n\t\tif (qs('.message', ajaxstatus)) { // success\n\t\t\teditChanged = null;\n\t\t}\n\t\tadminerHighlighter(qsa('code', ajaxstatus));\n\t\tmessagesPrint(ajaxstatus);\n\t}, data, message);\n}\n\n\n\n/** Display edit field\n* @param MouseEvent\n* @param number display textarea instead of input, 2 - load long text\n* @param [string] warning to display\n* @return boolean\n* @this HTMLElement\n*/\nfunction selectClick(event, text, warning) {\n\tconst td = this;\n\tconst target = event.target;\n\tif (!isCtrl(event) || isTag(td.firstChild, 'input|textarea') || isTag(target, 'a')) {\n\t\treturn;\n\t}\n\tif (warning) {\n\t\talert(warning);\n\t\treturn true;\n\t}\n\tconst original = td.innerHTML;\n\ttext = text || /\\n/.test(original);\n\tconst input = document.createElement(text ? 'textarea' : 'input');\n\tinput.onkeydown = event => {\n\t\tif (event.keyCode == 27 && !event.shiftKey && !event.altKey && !isCtrl(event)) { // 27 - Esc\n\t\t\tinputBlur.apply(input);\n\t\t\ttd.innerHTML = original;\n\t\t}\n\t};\n\n\tconst pos = getSelection().anchorOffset;\n\tlet value = (td.firstChild && td.firstChild.alt) || td.textContent;\n\tconst tdStyle = window.getComputedStyle(td, null);\n\n\tinput.style.width = Math.max(td.clientWidth - parseFloat(tdStyle.paddingLeft) - parseFloat(tdStyle.paddingRight), (text ? 200 : 20)) + 'px';\n\n\tif (text) {\n\t\tlet rows = 1;\n\t\tvalue.replace(/\\n/g, () => {\n\t\t\trows++;\n\t\t});\n\t\tinput.rows = rows;\n\t}\n\tif (qsa('i', td).length) { // <i> - NULL\n\t\tvalue = '';\n\t}\n\ttd.innerHTML = '';\n\ttd.appendChild(input);\n\tsetupSubmitHighlight(td);\n\tinput.focus();\n\tif (text == 2) { // long text\n\t\treturn ajax(location.href + '&' + encodeURIComponent(td.id) + '=', request => {\n\t\t\tif (request.responseText) {\n\t\t\t\tinput.value = request.responseText;\n\t\t\t\tinput.name = td.id;\n\t\t\t}\n\t\t});\n\t}\n\tinput.value = value;\n\tinput.name = td.id;\n\tinput.selectionStart = pos;\n\tinput.selectionEnd = pos;\n\treturn true;\n}\n\n\n\n/** Load and display next page in select\n* @param number\n* @param string\n* @return boolean false for success\n* @this HTMLLinkElement\n*/\nfunction selectLoadMore(limit, loading) {\n\tconst a = this;\n\tconst title = a.innerHTML;\n\tconst href = a.href;\n\ta.innerHTML = loading;\n\tif (href) {\n\t\ta.removeAttribute('href');\n\t\treturn !ajax(href, request => {\n\t\t\tconst tbody = document.createElement('tbody');\n\t\t\ttbody.innerHTML = request.responseText;\n\t\t\tadminerHighlighter(qsa('code', tbody));\n\t\t\tqs('#table').appendChild(tbody);\n\t\t\tif (tbody.children.length < limit) {\n\t\t\t\ta.remove();\n\t\t\t} else {\n\t\t\t\ta.href = href.replace(/\\d+\$/, page => +page + 1);\n\t\t\t\ta.innerHTML = title;\n\t\t\t}\n\t\t});\n\t}\n}\n\n\n\n/** Stop event propagation\n* @param Event\n*/\nfunction eventStop(event) {\n\tevent.stopPropagation();\n}\n\n\n\n/** Setup highlighting of default submit button on form field focus\n* @param HTMLElement\n*/\nfunction setupSubmitHighlight(parent) {\n\tfor (const input of qsa('input, select, textarea', parent)) {\n\t\tsetupSubmitHighlightInput(input);\n\t}\n}\n\n/** Setup submit highlighting for single element\n* @param HTMLElement\n*/\nfunction setupSubmitHighlightInput(input) {\n\tif (!/submit|button|image|file/.test(input.type)) {\n\t\taddEvent(input, 'focus', inputFocus);\n\t\taddEvent(input, 'blur', inputBlur);\n\t}\n}\n\n/** Highlight default submit button\n* @this HTMLInputElement\n*/\nfunction inputFocus() {\n\talterClass(findDefaultSubmit(this), 'default', true);\n}\n\n/** Unhighlight default submit button\n* @this HTMLInputElement\n*/\nfunction inputBlur() {\n\talterClass(findDefaultSubmit(this), 'default');\n}\n\n/** Find submit button used by Enter\n* @param HTMLElement\n* @return HTMLInputElement\n*/\nfunction findDefaultSubmit(el) {\n\tif (el.jushTextarea) {\n\t\tel = el.jushTextarea;\n\t}\n\tif (!el.form) {\n\t\treturn null;\n\t}\n\tfor (const input of qsa('input', el.form)) {\n\t\tif (input.type == 'submit' && !input.style.zIndex) {\n\t\t\treturn input;\n\t\t}\n\t}\n}\n\n\n\n/** Add event listener\n* @param HTMLElement\n* @param string without 'on'\n* @param function\n*/\nfunction addEvent(el, action, handler) {\n\tel.addEventListener(action, handler, false);\n}\n\n/** Clone node and setup submit highlighting\n* @param HTMLElement\n* @return HTMLElement\n*/\nfunction cloneNode(el) {\n\tconst el2 = el.cloneNode(true);\n\tconst selector = 'input, select';\n\tconst origEls = qsa(selector, el);\n\tconst cloneEls = qsa(selector, el2);\n\tfor (let i=0; i < origEls.length; i++) {\n\t\tconst origEl = origEls[i];\n\t\tfor (const key in origEl) {\n\t\t\tif (/^on/.test(key) && origEl[key]) {\n\t\t\t\tcloneEls[i][key] = origEl[key];\n\t\t\t}\n\t\t}\n\t}\n\tsetupSubmitHighlight(el2);\n\treturn el2;\n}\n\noninput = event => {\n\tconst target = event.target;\n\tconst maxLength = target.dataset.maxlength;\n\talterClass(target, 'maxlength', target.value && maxLength != null && target.value.length > maxLength); // maxLength could be 0\n};\n\naddEvent(document, 'click', event => {\n\tif (!qs('#foot').contains(event.target)) {\n\t\talterClass(qs('#foot'), 'foot', true);\n\t}\n});\n'use strict'; // Adminer specific functions\n\nlet autocompleter; // set in adminer.inc.php\n\n/** Load syntax highlighting\n* @param string first three characters of database system version\n* @param [string]\n*/\nfunction syntaxHighlighting(version, vendor) {\n\taddEventListener('DOMContentLoaded', () => {\n\t\tif (window.jush) {\n\t\t\tjush.create_links = 'target=\"_blank\" rel=\"noreferrer noopener\"';\n\t\t\tif (version) {\n\t\t\t\tfor (let key in jush.urls) {\n\t\t\t\t\tlet obj = jush.urls;\n\t\t\t\t\tif (typeof obj[key] != 'string') {\n\t\t\t\t\t\tobj = obj[key];\n\t\t\t\t\t\tkey = 0;\n\t\t\t\t\t\tif (vendor == 'maria') {\n\t\t\t\t\t\t\tfor (let i = 1; i < obj.length; i++) {\n\t\t\t\t\t\t\t\tobj[i] = obj[i]\n\t\t\t\t\t\t\t\t\t.replace('.html', '/')\n\t\t\t\t\t\t\t\t\t.replace('-type-syntax', '-data-types')\n\t\t\t\t\t\t\t\t\t.replace(/numeric-(data-types)/, '\$1-\$&')\n\t\t\t\t\t\t\t\t\t.replace(/replication-options-(master|binary-log)\\//, 'replication-and-binary-log-system-variables/')\n\t\t\t\t\t\t\t\t\t.replace('server-options/', 'server-system-variables/')\n\t\t\t\t\t\t\t\t\t.replace('innodb-parameters/', 'innodb-system-variables/')\n\t\t\t\t\t\t\t\t\t.replace(/#(statvar|sysvar|option_mysqld)_(.*)/, '#\$2')\n\t\t\t\t\t\t\t\t\t.replace(/#sysvar_(.*)/, '#\$1')\n\t\t\t\t\t\t\t\t;\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\n\t\t\t\t\tobj[key] = (vendor == 'maria' ? obj[key].replace('dev.mysql.com/doc/mysql', 'mariadb.com/kb') : obj[key]) // MariaDB\n\t\t\t\t\t\t.replace('/doc/mysql', '/doc/refman/' + version) // MySQL\n\t\t\t\t\t;\n\t\t\t\t\tif (vendor != 'cockroach') {\n\t\t\t\t\t\tobj[key] = obj[key].replace('/docs/current', '/docs/' + version); // PostgreSQL\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (window.jushLinks) {\n\t\t\t\tjush.custom_links = jushLinks;\n\t\t\t}\n\t\t\tjush.highlight_tag('code', 0);\n\t\t\tadminerHighlighter = els => jush.highlight_tag(els, 0);\n\t\t\tfor (const tag of qsa('textarea')) {\n\t\t\t\tif (/(^|\\s)jush-/.test(tag.className)) {\n\t\t\t\t\tconst pre = jush.textarea(tag, autocompleter);\n\t\t\t\t\tif (pre) {\n\t\t\t\t\t\tsetupSubmitHighlightInput(pre);\n\t\t\t\t\t\ttag.onchange = () => {\n\t\t\t\t\t\t\tpre.textContent = tag.value;\n\t\t\t\t\t\t\tpre.oninput();\n\t\t\t\t\t\t};\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t});\n}\n\n/** Get value of dynamically created form field\n* @param HTMLFormElement\n* @param string\n* @return HTMLElement\n*/\nfunction formField(form, name) {\n\t// required in IE < 8, form.elements[name] doesn't work\n\tfor (let i=0; i < form.length; i++) {\n\t\tif (form[i].name == name) {\n\t\t\treturn form[i];\n\t\t}\n\t}\n}\n\n/** Try to change input type to password or to text\n* @param HTMLInputElement\n* @param boolean\n*/\nfunction typePassword(el, disable) {\n\ttry {\n\t\tel.type = (disable ? 'text' : 'password');\n\t} catch (e) { // empty\n\t}\n}\n\n/** Install toggle handler\n* @param [HTMLElement]\n*/\nfunction messagesPrint(parent) {\n\tfor (const el of qsa('.toggle', parent)) {\n\t\tel.onclick = partial(toggle, el.getAttribute('href').substr(1));\n\t}\n\tfor (const el of qsa('.copy', parent)) {\n\t\tel.onclick = () => {\n\t\t\tnavigator.clipboard.writeText(qs('code', el.parentElement).innerText).then(() => el.textContent = '\xe2\x9c\x93');\n\t\t\tsetTimeout(() => el.textContent = '\xf0\x9f\x97\x90', 1000);\n\t\t\treturn false;\n\t\t};\n\t}\n}\n\n\n\n/** Hide or show some login rows for selected driver\n* @param HTMLSelectElement\n*/\nfunction loginDriver(driver) {\n\tconst trs = parentTag(driver, 'table').rows;\n\tconst disabled = /sqlite/.test(selectValue(driver));\n\talterClass(trs[1], 'hidden', disabled);\t// 1 - row with server\n\ttrs[1].getElementsByTagName('input')[0].disabled = disabled;\n}\n\n\n\nlet dbCtrl;\nconst dbPrevious = {};\n\n/** Check if database should be opened to a new window\n* @param MouseEvent\n* @this HTMLSelectElement\n*/\nfunction dbMouseDown(event) {\n\t// Firefox: mouse-down event does not contain pressed key information for OPTION.\n\t// Chrome: mouse-down event has inherited key information from SELECT.\n\t// So we ignore the event for OPTION to work Ctrl+click correctly everywhere.\n\tif (event.target.tagName == \"OPTION\") {\n\t\treturn;\n\t}\n\n\tdbCtrl = isCtrl(event);\n\tif (dbPrevious[this.name] == undefined) {\n\t\tdbPrevious[this.name] = this.value;\n\t}\n}\n\n/** Load database after selecting it\n* @this HTMLSelectElement\n*/\nfunction dbChange() {\n\tif (dbCtrl) {\n\t\tthis.form.target = '_blank';\n\t}\n\tthis.form.submit();\n\tthis.form.target = '';\n\tif (dbCtrl && dbPrevious[this.name] != undefined) {\n\t\tthis.value = dbPrevious[this.name];\n\t\tdbPrevious[this.name] = undefined;\n\t}\n}\n\n\n\n/** Check whether the query will be executed with index\n* @this HTMLElement\n*/\nfunction selectFieldChange() {\n\tconst form = this.form;\n\tconst ok = (() => {\n\t\tfor (const input of qsa('input', form)) {\n\t\t\tif (input.value && /^fulltext/.test(input.name)) {\n\t\t\t\treturn true;\n\t\t\t}\n\t\t}\n\t\tlet ok = form.limit.value;\n\t\tlet group = false;\n\t\tconst columns = {};\n\t\tfor (const select of qsa('select', form)) {\n\t\t\tconst col = selectValue(select);\n\t\t\tlet match = /^(where.+)col]/.exec(select.name);\n\t\t\tif (match) {\n\t\t\t\tconst op = selectValue(form[match[1] + 'op]']);\n\t\t\t\tconst val = form[match[1] + 'val]'].value;\n\t\t\t\tif (col in indexColumns && (!/LIKE|REGEXP/.test(op) || (op == 'LIKE' && val.charAt(0) != '%'))) {\n\t\t\t\t\treturn true;\n\t\t\t\t} else if (col || val) {\n\t\t\t\t\tok = false;\n\t\t\t\t}\n\t\t\t}\n\t\t\tif ((match = /^(columns.+)fun]/.exec(select.name))) {\n\t\t\t\tif (/^(avg|count|count distinct|group_concat|max|min|sum)\$/.test(col)) {\n\t\t\t\t\tgroup = true;\n\t\t\t\t}\n\t\t\t\tconst val = selectValue(form[match[1] + 'col]']);\n\t\t\t\tif (val) {\n\t\t\t\t\tcolumns[col && col != 'count' ? '' : val] = 1;\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (col && /^order/.test(select.name)) {\n\t\t\t\tif (!(col in indexColumns)) {\n\t\t\t\t\tok = false;\n\t\t\t\t}\n\t\t\t\tbreak;\n\t\t\t}\n\t\t}\n\t\tif (group) {\n\t\t\tfor (const col in columns) {\n\t\t\t\tif (!(col in indexColumns)) {\n\t\t\t\t\tok = false;\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\treturn ok;\n\t})();\n\tsetHtml('noindex', (ok ? '' : '!'));\n}\n\n\n\nlet added = '.', rowCount;\n\n/** Check if val is equal to a-delimiter-b where delimiter is '_', '' or big letter\n* @param string\n* @param string\n* @param string\n* @return boolean\n*/\nfunction delimiterEqual(val, a, b) {\n\treturn (val == a + '_' + b || val == a + b || val == a + b.charAt(0).toUpperCase() + b.substr(1));\n}\n\n/** Escape string to use as identifier\n* @param string\n* @return string\n*/\nfunction idfEscape(s) {\n\treturn s.replace(/`/, '``');\n}\n\n\n\n/** Set up event handlers for edit_fields().\n*/\nfunction editFields() {\n\tfor (const el of qsa('[name\$=\"[field]\"]')) {\n\t\tel.oninput = function () {\n\t\t\teditingNameChange.call(this);\n\t\t\tif (!this.defaultValue) {\n\t\t\t\teditingAddRow.call(this);\n\t\t\t}\n\t\t};\n\t}\n\tfor (const el of qsa('[name\$=\"[length]\"]')) {\n\t\tmixin(el, {onfocus: editingLengthFocus, oninput: editingLengthChange});\n\t}\n\tfor (const el of qsa('[name\$=\"[type]\"]')) {\n\t\tmixin(el, {\n\t\t\tonfocus: function () {\n\t\t\t\tlastType = selectValue(this);\n\t\t\t},\n\t\t\tonchange: editingTypeChange,\n\t\t\tonmouseover: function (event) {\n\t\t\t\thelpMouseover.call(this, event, event.target.value, 1);\n\t\t\t},\n\t\t\tonmouseout: helpMouseout\n\t\t});\n\t}\n}\n\n/** Handle clicks on fields editing\n* @param MouseEvent\n* @return boolean false to cancel action\n*/\nfunction editingClick(event) {\n\tlet el = parentTag(event.target, 'button');\n\tif (el) {\n\t\tconst name = el.name;\n\t\tif (/^add\\[/.test(name)) {\n\t\t\teditingAddRow.call(el, 1);\n\t\t} else if (/^up\\[/.test(name)) {\n\t\t\teditingMoveRow.call(el, 1);\n\t\t} else if (/^down\\[/.test(name)) {\n\t\t\teditingMoveRow.call(el);\n\t\t} else if (/^drop_col\\[/.test(name)) {\n\t\t\teditingRemoveRow.call(el, 'fields\$1[field]');\n\t\t}\n\t\treturn false;\n\t}\n\tel = event.target;\n\tif (!isTag(el, 'input')) {\n\t\tel = parentTag(el, 'label');\n\t\tel = el && qs('input', el);\n\t}\n\tif (el) {\n\t\tconst name = el.name;\n\t\tif (name == 'auto_increment_col') {\n\t\t\tconst field = el.form['fields[' + el.value + '][field]'];\n\t\t\tif (!field.value) {\n\t\t\t\tfield.value = 'id';\n\t\t\t\tfield.oninput();\n\t\t\t}\n\t\t}\n\t}\n}\n\n/** Handle input on fields editing\n* @param InputEvent\n*/\nfunction editingInput(event) {\n\tconst el = event.target;\n\tif (/\\[default]\$/.test(el.name)) {\n\t\t el.previousElementSibling.checked = true;\n\t\t el.previousElementSibling.selectedIndex = Math.max(el.previousElementSibling.selectedIndex, 1);\n\t}\n}\n\n/** Detect foreign key\n* @this HTMLInputElement\n*/\nfunction editingNameChange() {\n\tconst name = this.name.substr(0, this.name.length - 7);\n\tconst type = formField(this.form, name + '[type]');\n\tconst opts = type.options;\n\tlet candidate; // don't select anything with ambiguous match (like column `id`)\n\tconst val = this.value;\n\tfor (let i = opts.length; i--; ) {\n\t\tconst match = /(.+)`(.+)/.exec(opts[i].value);\n\t\tif (!match) { // common type\n\t\t\tif (candidate && i == opts.length - 2 && val == opts[candidate].value.replace(/.+`/, '') && name == 'fields[1]') { // single target table, link to column, first field - probably `id`\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tbreak;\n\t\t}\n\t\tconst base = match[1];\n\t\tconst column = match[2];\n\t\tfor (const table of [ base, base.replace(/s\$/, ''), base.replace(/es\$/, '') ]) {\n\t\t\tif (val == column || val == table || delimiterEqual(val, table, column) || delimiterEqual(val, column, table)) {\n\t\t\t\tif (candidate) {\n\t\t\t\t\treturn;\n\t\t\t\t}\n\t\t\t\tcandidate = i;\n\t\t\t\tbreak;\n\t\t\t}\n\t\t}\n\t}\n\tif (candidate) {\n\t\ttype.selectedIndex = candidate;\n\t\ttype.onchange();\n\t}\n}\n\n/** Add table row for next field\n* @param [boolean]\n* @return boolean false\n* @this HTMLInputElement\n*/\nfunction editingAddRow(focus) {\n\tconst match = /(\\d+)(\\.\\d+)?/.exec(this.name);\n\tconst x = match[0] + (match[2] ? added.substr(match[2].length) : added) + '1';\n\tconst row = parentTag(this, 'tr');\n\tconst row2 = cloneNode(row);\n\tlet tags = qsa('select, input, button', row);\n\tlet tags2 = qsa('select, input, button', row2);\n\tfor (let i=0; i < tags.length; i++) {\n\t\ttags2[i].name = tags[i].name.replace(/[0-9.]+/, x);\n\t\ttags2[i].selectedIndex = (/\\[(generated)/.test(tags[i].name) ? 0 : tags[i].selectedIndex);\n\t}\n\ttags = qsa('input', row);\n\ttags2 = qsa('input', row2);\n\tconst input = tags2[0]; // IE loose tags2 after insertBefore()\n\tfor (let i=0; i < tags.length; i++) {\n\t\tif (tags[i].name == 'auto_increment_col') {\n\t\t\ttags2[i].value = x;\n\t\t\ttags2[i].checked = false;\n\t\t}\n\t\tif (/\\[(orig|field|comment|default)/.test(tags[i].name)) {\n\t\t\ttags2[i].value = '';\n\t\t}\n\t\tif (/\\[(generated)/.test(tags[i].name)) {\n\t\t\ttags2[i].checked = false;\n\t\t}\n\t}\n\ttags[0].oninput = editingNameChange;\n\trow.parentNode.insertBefore(row2, row.nextSibling);\n\tif (focus) {\n\t\tinput.oninput = editingNameChange;\n\t\tinput.focus();\n\t}\n\tadded += '0';\n\trowCount++;\n\treturn false;\n}\n\n/** Remove table row for field\n* @param string regular expression replacement\n* @return boolean false\n* @this HTMLInputElement\n*/\nfunction editingRemoveRow(name) {\n\tconst field = formField(this.form, this.name.replace(/[^[]+(.+)/, name));\n\tfield.remove();\n\tparentTag(this, 'tr').style.display = 'none';\n\treturn false;\n}\n\n/** Move table row for field\n* @param [boolean]\n* @return boolean false for success\n* @this HTMLInputElement\n*/\nfunction editingMoveRow(up){\n\tconst row = parentTag(this, 'tr');\n\tif (!('nextElementSibling' in row)) {\n\t\treturn true;\n\t}\n\trow.parentNode.insertBefore(row, up\n\t\t? row.previousElementSibling\n\t\t: row.nextElementSibling ? row.nextElementSibling.nextElementSibling : row.parentNode.firstChild);\n\treturn false;\n}\n\nlet lastType = '';\n\n/** Clear length and hide collation or unsigned\n* @this HTMLSelectElement\n*/\nfunction editingTypeChange() {\n\tconst type = this;\n\tconst name = type.name.substr(0, type.name.length - 6);\n\tconst text = selectValue(type);\n\tfor (const el of type.form.elements) {\n\t\tif (el.name == name + '[length]') {\n\t\t\tif (!(\n\t\t\t\t(/(char|binary)\$/.test(lastType) && /(char|binary)\$/.test(text))\n\t\t\t\t|| (/(enum|set)\$/.test(lastType) && /(enum|set)\$/.test(text))\n\t\t\t)) {\n\t\t\t\tel.value = '';\n\t\t\t}\n\t\t\tel.oninput.apply(el);\n\t\t}\n\t\tif (lastType == 'timestamp' && el.name == name + '[generated]' && /timestamp/i.test(formField(type.form, name + '[default]').value)) {\n\t\t\tel.checked = false;\n\t\t\tel.selectedIndex = 0;\n\t\t}\n\t\tif (el.name == name + '[collation]') {\n\t\t\talterClass(el, 'hidden', !/(char|text|enum|set)\$/.test(text));\n\t\t}\n\t\tif (el.name == name + '[unsigned]') {\n\t\t\talterClass(el, 'hidden', !/(^|[^o])int(?!er)|numeric|real|float|double|decimal|money/.test(text));\n\t\t}\n\t\tif (el.name == name + '[on_update]') {\n\t\t\talterClass(el, 'hidden', !/timestamp|datetime/.test(text)); // MySQL supports datetime since 5.6.5\n\t\t}\n\t\tif (el.name == name + '[on_delete]') {\n\t\t\talterClass(el, 'hidden', !/`/.test(text));\n\t\t}\n\t}\n\thelpClose();\n}\n\n/** Mark length as required\n* @this HTMLInputElement\n*/\nfunction editingLengthChange() {\n\talterClass(this, 'required', !this.value.length && /var(char|binary)\$/.test(selectValue(this.parentNode.previousSibling.firstChild)));\n}\n\n/** Edit enum or set\n* @this HTMLInputElement\n*/\nfunction editingLengthFocus() {\n\tconst td = this.parentNode;\n\tif (/^(enum|set)\$/.test(selectValue(td.previousSibling.firstChild))) {\n\t\tconst edit = qs('#enum-edit');\n\t\tedit.value = enumValues(this.value);\n\t\ttd.appendChild(edit);\n\t\tthis.style.display = 'none';\n\t\tedit.style.display = 'inline';\n\t\tedit.focus();\n\t}\n}\n\n/** Get enum values\n* @param string\n* @return string values separated by newlines\n*/\nfunction enumValues(s) {\n\tconst re = /(^|,)\\s*'(([^\\\\']|\\\\.|'')*)'\\s*/g;\n\tconst result = [];\n\tlet offset = 0;\n\tlet match;\n\twhile ((match = re.exec(s))) {\n\t\tif (offset != match.index) {\n\t\t\tbreak;\n\t\t}\n\t\tresult.push(match[2].replace(/'(')|\\\\(.)/g, '\$1\$2'));\n\t\toffset += match[0].length;\n\t}\n\treturn (offset == s.length ? result.join('\\n') : s);\n}\n\n/** Finish editing of enum or set\n* @this HTMLTextAreaElement\n*/\nfunction editingLengthBlur() {\n\tconst field = this.parentNode.firstChild;\n\tconst val = this.value;\n\tfield.value = (/^'[^\\n]+'\$/.test(val) ? val : val && \"'\" + val.replace(/\\n+\$/, '').replace(/'/g, \"''\").replace(/\\\\/g, '\\\\\\\\').replace(/\\n/g, \"','\") + \"'\");\n\tfield.style.display = 'inline';\n\tthis.style.display = 'none';\n}\n\n/** Show or hide selected table column\n* @param boolean\n* @param number\n*/\nfunction columnShow(checked, column) {\n\tfor (const tr of qsa('tr', qs('#edit-fields'))) {\n\t\talterClass(qsa('td', tr)[column], 'hidden', !checked);\n\t}\n}\n\n/** Show or hide index column options\n* @param boolean\n*/\nfunction indexOptionsShow(checked) {\n\tfor (const option of qsa('.idxopts')) {\n\t\talterClass(option, 'hidden', !checked);\n\t}\n}\n\n/** Display partition options\n* @this HTMLSelectElement\n*/\nfunction partitionByChange() {\n\tconst partitionTable = /RANGE|LIST/.test(selectValue(this));\n\talterClass(this.form['partitions'], 'hidden', partitionTable || !this.selectedIndex);\n\talterClass(qs('#partition-table'), 'hidden', !partitionTable);\n\thelpClose();\n}\n\n/** Add next partition row\n* @this HTMLInputElement\n*/\nfunction partitionNameChange() {\n\tconst row = cloneNode(parentTag(this, 'tr'));\n\trow.firstChild.firstChild.value = '';\n\tparentTag(this, 'table').appendChild(row);\n\tthis.oninput = () => { };\n}\n\n/** Show or hide comment fields\n* @param HTMLInputElement\n* @param [boolean] whether to focus Comment if checked\n*/\nfunction editingCommentsClick(el, focus) {\n\tconst comment = el.form['Comment'];\n\tcolumnShow(el.checked, 6);\n\talterClass(comment, 'hidden', !el.checked);\n\tif (focus && el.checked) {\n\t\tcomment.focus();\n\t}\n}\n\n\n\n/** Uncheck 'all' checkbox\n* @param MouseEvent\n* @this HTMLTableElement\n*/\nfunction dumpClick(event) {\n\tlet el = parentTag(event.target, 'label');\n\tif (el) {\n\t\tel = qs('input', el);\n\t\tconst match = /(.+)\\[]\$/.exec(el.name);\n\t\tif (match) {\n\t\t\tcheckboxClick.call(el, event);\n\t\t\tformUncheck('check-' + match[1]);\n\t\t}\n\t}\n}\n\n\n\n/** Add row for foreign key\n* @this HTMLSelectElement\n*/\nfunction foreignAddRow() {\n\tconst row = cloneNode(parentTag(this, 'tr'));\n\tthis.onchange = () => { };\n\tfor (const select of qsa('select', row)) {\n\t\tselect.name = select.name.replace(/\\d+]/, '1\$&');\n\t\tselect.selectedIndex = 0;\n\t}\n\tparentTag(this, 'table').appendChild(row);\n}\n\n\n\n/** Add row for indexes\n* @this HTMLSelectElement\n*/\nfunction indexesAddRow() {\n\tconst row = cloneNode(parentTag(this, 'tr'));\n\tthis.onchange = () => { };\n\tfor (const select of qsa('select', row)) {\n\t\tselect.name = select.name.replace(/indexes\\[\\d+/, '\$&1');\n\t\tselect.selectedIndex = 0;\n\t}\n\tfor (const input of qsa('input', row)) {\n\t\tinput.name = input.name.replace(/indexes\\[\\d+/, '\$&1');\n\t\tinput.value = '';\n\t}\n\tparentTag(this, 'table').appendChild(row);\n}\n\n/** Change column in index\n* @param string name prefix\n* @this HTMLSelectElement\n*/\nfunction indexesChangeColumn(prefix) {\n\tconst names = [];\n\tfor (const tag in { 'select': 1, 'input': 1 }) {\n\t\tfor (const column of qsa(tag, parentTag(this, 'td'))) {\n\t\t\tif (/\\[columns]/.test(column.name)) {\n\t\t\t\tconst value = selectValue(column);\n\t\t\t\tif (value) {\n\t\t\t\t\tnames.push(value);\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\tthis.form[this.name.replace(/].*/, '][name]')].value = prefix + names.join('_');\n}\n\n/** Add column for index\n* @param string name prefix\n* @this HTMLSelectElement\n*/\nfunction indexesAddColumn(prefix) {\n\tconst field = this;\n\tconst select = field.form[field.name.replace(/].*/, '][type]')];\n\tif (!select.selectedIndex) {\n\t\twhile (selectValue(select) != \"INDEX\" && select.selectedIndex < select.options.length) {\n\t\t\tselect.selectedIndex++;\n\t\t}\n\t\tselect.onchange();\n\t}\n\tconst column = cloneNode(field.parentNode);\n\tfor (const select of qsa('select', column)) {\n\t\tselect.name = select.name.replace(/]\\[\\d+/, '\$&1');\n\t\tselect.selectedIndex = 0;\n\t}\n\tfield.onchange = partial(indexesChangeColumn, prefix);\n\tfor (const input of qsa('input', column)) {\n\t\tinput.name = input.name.replace(/]\\[\\d+/, '\$&1');\n\t\tif (input.type != 'checkbox') {\n\t\t\tinput.value = '';\n\t\t}\n\t}\n\tparentTag(field, 'td').appendChild(column);\n\tfield.onchange();\n}\n\n\n\n/** Update the form action\n* @param HTMLFormElement\n* @param string\n*/\nfunction sqlSubmit(form, root) {\n\tconst action = root\n\t\t+ '&sql=' + encodeURIComponent(form['query'].value)\n\t\t+ (form['limit'].value ? '&limit=' + +form['limit'].value : '')\n\t\t+ (form['error_stops'].checked ? '&error_stops=1' : '')\n\t\t+ (form['only_errors'].checked ? '&only_errors=1' : '')\n\t;\n\tif ((document.location.origin + document.location.pathname + action).length < 2000) { // reasonable minimum is 2048\n\t\tform.action = action;\n\t}\n}\n\n/** Check if PHP can handle the uploaded files\n* @param Event\n* @param number\n* @param string\n* @param number\n* @param string\n*/\nfunction fileChange(event, count, countMessage, size, sizeMessage) {\n\tif (event.target.files.length > count) {\n\t\talert(countMessage);\n\t} else if (Array.from(event.target.files).reduce((sum, file) => sum + file.size, 0) > size) {\n\t\talert(sizeMessage);\n\t}\n}\n\n\n\n/** Handle changing trigger time or event\n* @param RegExp\n* @param string\n* @param HTMLFormElement\n*/\nfunction triggerChange(tableRe, table, form) {\n\tconst formEvent = selectValue(form['Event']);\n\tif (tableRe.test(form['Trigger'].value)) {\n\t\tform['Trigger'].value = table + '_' + (selectValue(form['Timing']).charAt(0) + formEvent.charAt(0)).toLowerCase();\n\t}\n\talterClass(form['Of'], 'hidden', !/ OF/.test(formEvent));\n}\n\n\n\nlet that, x, y; // em and tablePos defined in schema.inc.php\n\n/** Get mouse position\n* @param MouseEvent\n* @this HTMLElement\n*/\nfunction schemaMousedown(event) {\n\tif ((event.which || event.button) == 1) {\n\t\tthat = this;\n\t\tx = event.clientX - this.offsetLeft;\n\t\ty = event.clientY - this.offsetTop;\n\t}\n}\n\n/** Move object\n* @param MouseEvent\n*/\nfunction schemaMousemove(event) {\n\tif (that !== undefined) {\n\t\tconst left = (event.clientX - x) / em;\n\t\tconst top = (event.clientY - y) / em;\n\t\tconst lineSet = { };\n\t\tfor (const div of qsa('div', that)) {\n\t\t\tif (div.classList.contains('references')) {\n\t\t\t\tconst div2 = qs('[id=\"' + (/^refs/.test(div.id) ? 'refd' : 'refs') + div.id.substr(4) + '\"]');\n\t\t\t\tconst ref = (tablePos[div.title] || [ div2.parentNode.offsetTop / em, 0 ]);\n\t\t\t\tlet left1 = -1;\n\t\t\t\tconst id = div.id.replace(/^ref.(.+)-.+/, '\$1');\n\t\t\t\tif (div.parentNode != div2.parentNode) {\n\t\t\t\t\tleft1 = Math.min(0, ref[1] - left) - 1;\n\t\t\t\t\tdiv.style.left = left1 + 'em';\n\t\t\t\t\tdiv.querySelector('div').style.width = -left1 + 'em';\n\t\t\t\t\tconst left2 = Math.min(0, left - ref[1]) - 1;\n\t\t\t\t\tdiv2.style.left = left2 + 'em';\n\t\t\t\t\tdiv2.querySelector('div').style.width = -left2 + 'em';\n\t\t\t\t}\n\t\t\t\tif (!lineSet[id]) {\n\t\t\t\t\tconst line = qs('[id=\"' + div.id.replace(/^....(.+)-.+\$/, 'refl\$1') + '\"]');\n\t\t\t\t\tconst top1 = top + div.offsetTop / em;\n\t\t\t\t\tlet top2 = top + div2.offsetTop / em;\n\t\t\t\t\tif (div.parentNode != div2.parentNode) {\n\t\t\t\t\t\ttop2 += ref[0] - top;\n\t\t\t\t\t\tline.querySelector('div').style.height = Math.abs(top1 - top2) + 'em';\n\t\t\t\t\t}\n\t\t\t\t\tline.style.left = (left + left1) + 'em';\n\t\t\t\t\tline.style.top = Math.min(top1, top2) + 'em';\n\t\t\t\t\tlineSet[id] = true;\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tthat.style.left = left + 'em';\n\t\tthat.style.top = top + 'em';\n\t}\n}\n\n/** Finish move\n* @param MouseEvent\n* @param string\n*/\nfunction schemaMouseup(event, db) {\n\tif (that !== undefined) {\n\t\ttablePos[that.firstChild.firstChild.firstChild.data] = [ (event.clientY - y) / em, (event.clientX - x) / em ];\n\t\tthat = undefined;\n\t\tlet s = '';\n\t\tfor (const key in tablePos) {\n\t\t\ts += '_' + key + ':' + Math.round(tablePos[key][0]) + 'x' + Math.round(tablePos[key][1]);\n\t\t}\n\t\ts = encodeURIComponent(s.substr(1));\n\t\tconst link = qs('#schema-link');\n\t\tlink.href = link.href.replace(/[^=]+\$/, '') + s;\n\t\tcookie('adminer_schema-' + db + '=' + s, 30); //! special chars in db\n\t}\n}\n\n\n\nlet helpOpen, helpIgnore; // when mouse outs <option> then it mouse overs border of <select> - ignore it\n\n/** Display help\n* @param MouseEvent\n* @param string\n* @param bool display on left side (otherwise on top)\n* @this HTMLElement\n*/\nfunction helpMouseover(event, text, side) {\n\tconst target = event.target;\n\tif (!text) {\n\t\thelpClose();\n\t} else if (window.jush && (!helpIgnore || this != target)) {\n\t\thelpOpen = 1;\n\t\tconst help = qs('#help');\n\t\thelp.innerHTML = text;\n\t\tjush.highlight_tag([ help ]);\n\t\talterClass(help, 'hidden');\n\t\tconst rect = target.getBoundingClientRect();\n\t\tconst body = document.documentElement;\n\t\thelp.style.top = (body.scrollTop + rect.top - (side ? (help.offsetHeight - target.offsetHeight) / 2 : help.offsetHeight)) + 'px';\n\t\thelp.style.left = (body.scrollLeft + rect.left - (side ? help.offsetWidth : (help.offsetWidth - target.offsetWidth) / 2)) + 'px';\n\t}\n}\n\n/** Close help after timeout\n* @param MouseEvent\n* @this HTMLElement\n*/\nfunction helpMouseout(event) {\n\thelpOpen = 0;\n\thelpIgnore = (this != event.target);\n\tsetTimeout(() => {\n\t\tif (!helpOpen) {\n\t\t\thelpClose();\n\t\t}\n\t}, 200);\n}\n\n/** Close help\n*/\nfunction helpClose() {\n\talterClass(qs('#help'), 'hidden', true);\n}\n";
+	echo "'use strict';\n\n/** Get first element by selector\n* @param string\n* @param [HTMLElement] defaults to document\n* @return HTMLElement\n*/\nfunction qs(selector, context) {\n\treturn (context || document).querySelector(selector);\n}\n\n/** Get last element by selector\n* @param string\n* @param [HTMLElement] defaults to document\n* @return HTMLElement\n*/\nfunction qsl(selector, context) {\n\tconst els = qsa(selector, context);\n\treturn els[els.length - 1];\n}\n\n/** Get all elements by selector\n* @param string\n* @param [HTMLElement] defaults to document\n* @return NodeList\n*/\nfunction qsa(selector, context) {\n\treturn (context || document).querySelectorAll(selector);\n}\n\n/** Return a function calling fn with the next arguments\n* @param function\n* @param ...\n* @return function with preserved this\n*/\nfunction partial(fn) {\n\tconst args = Array.apply(null, arguments).slice(1);\n\treturn function () {\n\t\treturn fn.apply(this, args);\n\t};\n}\n\n/** Return a function calling fn with the first parameter and then the next arguments\n* @param function\n* @param ...\n* @return function with preserved this\n*/\nfunction partialArg(fn) {\n\tconst args = Array.apply(null, arguments);\n\treturn function (arg) {\n\t\targs[0] = arg;\n\t\treturn fn.apply(this, args);\n\t};\n}\n\n/** Assign values from source to target\n* @param Object\n* @param Object\n*/\nfunction mixin(target, source) {\n\tfor (const key in source) {\n\t\ttarget[key] = source[key];\n\t}\n}\n\n/** Add or remove CSS class\n* @param HTMLElement\n* @param string\n* @param [boolean]\n*/\nfunction alterClass(el, className, enable) {\n\tif (el) {\n\t\tel.classList[enable ? 'add' : 'remove'](className);\n\t}\n}\n\n/** Toggle visibility\n* @param string\n* @return boolean false\n*/\nfunction toggle(id) {\n\tconst el = qs('#' + id);\n\tel && el.classList.toggle('hidden');\n\treturn false;\n}\n\n/** Set permanent cookie\n* @param string\n* @param number\n*/\nfunction cookie(assign, days) {\n\tconst date = new Date();\n\tdate.setDate(date.getDate() + days);\n\tdocument.cookie = assign + '; expires=' + date;\n}\n\n/** Verify current Adminer version\n* @param string\n*/\nfunction verifyVersion(current) {\n\tcookie('adminer_version=0', 1);\n\t// do not send X-Requested-With to avoid preflight\n\tfetch('https://www.adminer.org/version/?current=' + current).then(async response => {\n\t\tconst json = await response.json();\n\t\tcookie('adminer_version=' + (json.version || current), 7); // empty if there's no newer version\n\t\tqs('#version').textContent = json.version;\n\t});\n}\n\n/** Get value of select\n* @param HTMLElement <select> or <input>\n* @return string\n*/\nfunction selectValue(select) {\n\tif (!select.selectedIndex) {\n\t\treturn select.value;\n\t}\n\tconst selected = select.options[select.selectedIndex];\n\treturn ((selected.attributes.value || {}).specified ? selected.value : selected.text);\n}\n\n/** Verify if element has a specified tag name\n* @param HTMLElement\n* @param string regular expression\n* @return boolean\n*/\nfunction isTag(el, tag) {\n\tconst re = new RegExp('^(' + tag + ')\$', 'i');\n\treturn el && re.test(el.tagName);\n}\n\n/** Get parent node with specified tag name\n* @param HTMLElement\n* @param string regular expression\n* @return HTMLElement\n*/\nfunction parentTag(el, tag) {\n\twhile (el && !isTag(el, tag)) {\n\t\tel = el.parentNode;\n\t}\n\treturn el;\n}\n\n/** Set checked class\n* @param HTMLInputElement\n*/\nfunction trCheck(el) {\n\tconst tr = parentTag(el, 'tr');\n\talterClass(tr, 'checked', el.checked);\n\tif (el.form && el.form['all'] && el.form['all'].onclick) { // Opera treats form.all as document.all\n\t\tel.form['all'].onclick();\n\t}\n}\n\n/** Fill number of selected items\n* @param string\n* @param string\n* @uses thousandsSeparator\n*/\nfunction selectCount(id, count) {\n\tsetHtml(id, (count === '' ? '' : '(' + (count + '').replace(/\\B(?=(\\d{3})+\$)/g, thousandsSeparator) + ')'));\n\tconst el = qs('#' + id);\n\tif (el) {\n\t\tfor (const input of qsa('input', el.parentNode.parentNode)) {\n\t\t\tif (input.type == 'submit') {\n\t\t\t\tinput.disabled = (count == '0');\n\t\t\t}\n\t\t}\n\t}\n}\n\n/** Check all elements matching given name\n* @param RegExp\n* @this HTMLInputElement\n*/\nfunction formCheck(name) {\n\tfor (const elem of this.form.elements) {\n\t\tif (name.test(elem.name)) {\n\t\t\telem.checked = this.checked;\n\t\t\ttrCheck(elem);\n\t\t}\n\t}\n}\n\n/** Check all rows in <table class=\"checkable\">\n*/\nfunction tableCheck() {\n\tfor (const input of qsa('table.checkable td:first-child input')) {\n\t\ttrCheck(input);\n\t}\n}\n\n/** Uncheck single element\n* @param string\n*/\nfunction formUncheck(id) {\n\tconst el = qs('#' + id);\n\tel.checked = false;\n\ttrCheck(el);\n}\n\n/** Get number of checked elements matching given name\n* @param HTMLInputElement\n* @param RegExp\n* @return number\n*/\nfunction formChecked(input, name) {\n\tlet checked = 0;\n\tfor (const el of input.form.elements) {\n\t\tif (name.test(el.name) && el.checked) {\n\t\t\tchecked++;\n\t\t}\n\t}\n\treturn checked;\n}\n\n/** Select clicked row\n* @param MouseEvent\n* @param [boolean] force click\n*/\nfunction tableClick(event, click) {\n\tconst td = parentTag(event.target, 'td');\n\tlet text;\n\tif (td && (text = td.dataset.text)) {\n\t\tif (selectClick.call(td, event, +text, td.dataset.warning)) {\n\t\t\treturn;\n\t\t}\n\t}\n\tclick = (click || !window.getSelection || getSelection().isCollapsed);\n\tlet el = event.target;\n\twhile (!isTag(el, 'tr')) {\n\t\tif (isTag(el, 'table|a|input|textarea')) {\n\t\t\tif (el.type != 'checkbox') {\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tcheckboxClick.call(el, event);\n\t\t\tclick = false;\n\t\t}\n\t\tel = el.parentNode;\n\t\tif (!el) { // Ctrl+click on text fields hides the element\n\t\t\treturn;\n\t\t}\n\t}\n\tel = el.firstChild.firstChild;\n\tif (click) {\n\t\tel.checked = !el.checked;\n\t\tel.onclick && el.onclick();\n\t}\n\tif (el.name == 'check[]') {\n\t\tel.form['all'].checked = false;\n\t\tformUncheck('all-page');\n\t}\n\tif (/^(tables|views)\\[\\]\$/.test(el.name)) {\n\t\tformUncheck('check-all');\n\t}\n\ttrCheck(el);\n}\n\nlet lastChecked;\n\n/** Shift-click on checkbox for multiple selection.\n* @param MouseEvent\n* @this HTMLInputElement\n*/\nfunction checkboxClick(event) {\n\tif (!this.name) {\n\t\treturn;\n\t}\n\tif (event.shiftKey && (!lastChecked || lastChecked.name == this.name)) {\n\t\tconst checked = (lastChecked ? lastChecked.checked : true);\n\t\tlet checking = !lastChecked;\n\t\tfor (const input of qsa('input', parentTag(this, 'table'))) {\n\t\t\tif (input.name === this.name) {\n\t\t\t\tif (checking) {\n\t\t\t\t\tinput.checked = checked;\n\t\t\t\t\ttrCheck(input);\n\t\t\t\t}\n\t\t\t\tif (input === this || input === lastChecked) {\n\t\t\t\t\tif (checking) {\n\t\t\t\t\t\tbreak;\n\t\t\t\t\t}\n\t\t\t\t\tchecking = true;\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t} else {\n\t\tlastChecked = this;\n\t}\n}\n\n/** Set HTML code of an element\n* @param string\n* @param string undefined to set parentNode to empty string\n*/\nfunction setHtml(id, html) {\n\tconst el = qs('[id=\"' + id.replace(/[\\\\\"]/g, '\\\\\$&') + '\"]'); // database name is used as ID\n\tif (el) {\n\t\tif (html == null) {\n\t\t\tel.parentNode.innerHTML = '';\n\t\t} else {\n\t\t\tel.innerHTML = html;\n\t\t}\n\t}\n}\n\n/** Find node position\n* @param Node\n* @return number\n*/\nfunction nodePosition(el) {\n\tlet pos = 0;\n\twhile ((el = el.previousSibling)) {\n\t\tpos++;\n\t}\n\treturn pos;\n}\n\n/** Go to the specified page\n* @param string\n* @param string\n*/\nfunction pageClick(href, page) {\n\tif (!isNaN(page) && page) {\n\t\tlocation.href = href + (page != 1 ? '&page=' + (page - 1) : '');\n\t}\n}\n\n\n\n/** Display items in menu\n* @param MouseEvent\n* @this HTMLElement\n*/\nfunction menuOver(event) {\n\tconst a = event.target;\n\tif (isTag(a, 'a|span') && a.offsetLeft + a.offsetWidth > a.parentNode.offsetWidth - 15) { // 15 - ellipsis\n\t\tthis.style.overflow = 'visible';\n\t}\n}\n\n/** Hide items in menu\n* @this HTMLElement\n*/\nfunction menuOut() {\n\tthis.style.overflow = 'hidden';\n}\n\n\n\n/** Add row in select fieldset\n* @this HTMLSelectElement\n*/\nfunction selectAddRow() {\n\tconst field = this;\n\tconst row = cloneNode(field.parentNode);\n\tfield.onchange = selectFieldChange;\n\tfield.onchange();\n\tfor (const select of qsa('select', row)) {\n\t\tselect.name = select.name.replace(/[a-z]\\[\\d+/, '\$&1');\n\t\tselect.selectedIndex = 0;\n\t}\n\tfor (const input of qsa('input', row)) {\n\t\tinput.name = input.name.replace(/[a-z]\\[\\d+/, '\$&1');\n\t\tinput.className = '';\n\t\tif (input.type == 'checkbox') {\n\t\t\tinput.checked = false;\n\t\t} else {\n\t\t\tinput.value = '';\n\t\t}\n\t}\n\tfield.parentNode.parentNode.appendChild(row);\n}\n\n/** Prevent onsearch handler on Enter\n* @param KeyboardEvent\n* @this HTMLInputElement\n*/\nfunction selectSearchKeydown(event) {\n\tif (event.keyCode == 13 || event.keyCode == 10) {\n\t\tthis.onsearch = () => { };\n\t}\n}\n\n/** Clear column name after resetting search\n* @this HTMLInputElement\n*/\nfunction selectSearchSearch() {\n\tif (!this.value) {\n\t\tthis.parentNode.firstChild.selectedIndex = 0;\n\t}\n}\n\n\n\n/** Toggle column context menu\n* @param [string] extra class name\n* @this HTMLElement\n*/\nfunction columnMouse(className) {\n\tfor (const span of qsa('span', this)) {\n\t\tif (/column/.test(span.className)) {\n\t\t\tspan.className = 'column' + (className || '');\n\t\t}\n\t}\n}\n\n\n\n/** Fill column in search field\n* @param string\n* @return boolean false\n*/\nfunction selectSearch(name) {\n\tlet el = qs('#fieldset-search');\n\tel.className = '';\n\tconst divs = qsa('div', el);\n\tlet i, div;\n\tfor (i=0; i < divs.length; i++) {\n\t\tdiv = divs[i];\n\t\tel = qs('[name\$=\"[col]\"]', div);\n\t\tif (el && selectValue(el) == name) {\n\t\t\tbreak;\n\t\t}\n\t}\n\tif (i == divs.length) {\n\t\tdiv.firstChild.value = name;\n\t\tdiv.firstChild.onchange();\n\t}\n\tqs('[name\$=\"[val]\"]', div).focus();\n\treturn false;\n}\n\n\n/** Check if Ctrl key (Command key on Mac) was pressed\n* @param KeyboardEvent|MouseEvent\n* @return boolean\n*/\nfunction isCtrl(event) {\n\treturn (event.ctrlKey || event.metaKey) && !event.altKey; // shiftKey allowed\n}\n\n\n\n/** Send form by Ctrl+Enter on <select> and <textarea>\n* @param KeyboardEvent\n* @param [string]\n* @return boolean\n*/\nfunction bodyKeydown(event, button) {\n\teventStop(event);\n\tlet target = event.target;\n\tif (target.jushTextarea) {\n\t\ttarget = target.jushTextarea;\n\t}\n\tif (isCtrl(event) && (event.keyCode == 13 || event.keyCode == 10) && isTag(target, 'select|textarea|input')) { // 13|10 - Enter\n\t\ttarget.blur();\n\t\tif (target.form[button]) {\n\t\t\ttarget.form[button].click();\n\t\t} else {\n\t\t\ttarget.form.dispatchEvent(new Event('submit', {bubbles: true}));\n\t\t\ttarget.form.submit();\n\t\t}\n\t\ttarget.focus();\n\t\treturn false;\n\t}\n\treturn true;\n}\n\n/** Open form to a new window on Ctrl+click or Shift+click\n* @param MouseEvent\n*/\nfunction bodyClick(event) {\n\tconst target = event.target;\n\tif ((isCtrl(event) || event.shiftKey) && target.type == 'submit' && isTag(target, 'input')) {\n\t\ttarget.form.target = '_blank';\n\t\tsetTimeout(() => {\n\t\t\t// if (isCtrl(event)) { focus(); } doesn't work\n\t\t\ttarget.form.target = '';\n\t\t}, 0);\n\t}\n}\n\n\n\n/** Change focus by Ctrl+Shift+Up or Ctrl+Shift+Down\n* @param KeyboardEvent\n* @return boolean\n*/\nfunction editingKeydown(event) {\n\tif ((event.keyCode == 40 || event.keyCode == 38) && isCtrl(event)) { // 40 - Down, 38 - Up\n\t\tconst target = event.target;\n\t\tconst sibling = (event.keyCode == 40 ? 'nextSibling' : 'previousSibling');\n\t\tlet el = target.parentNode.parentNode[sibling];\n\t\tif (el && (isTag(el, 'tr') || (el = el[sibling])) && isTag(el, 'tr') && (el = el.childNodes[nodePosition(target.parentNode)]) && (el = el.childNodes[nodePosition(target)])) {\n\t\t\tel.focus();\n\t\t}\n\t\treturn false;\n\t}\n\tif (event.shiftKey && !bodyKeydown(event, 'insert')) {\n\t\treturn false;\n\t}\n\treturn true;\n}\n\n/** Disable maxlength for functions\n* @this HTMLSelectElement\n*/\nfunction functionChange() {\n\tconst input = this.form[this.name.replace(/^function/, 'fields')];\n\tif (input) { // undefined with the set data type\n\t\tif (selectValue(this)) {\n\t\t\tif (input.origType === undefined) {\n\t\t\t\tinput.origType = input.type;\n\t\t\t\tinput.origMaxLength = input.dataset.maxlength;\n\t\t\t}\n\t\t\tdelete input.dataset.maxlength;\n\t\t\tinput.type = 'text';\n\t\t} else if (input.origType) {\n\t\t\tinput.type = input.origType;\n\t\t\tif (input.origMaxLength >= 0) {\n\t\t\t\tinput.dataset.maxlength = input.origMaxLength;\n\t\t\t}\n\t\t}\n\t\toninput({target: input});\n\t}\n\thelpClose();\n}\n\n/** Skip 'original' when typing\n* @param number\n* @this HTMLTableCellElement\n*/\nfunction skipOriginal(first) {\n\tconst fnSelect = qs('select', this.previousSibling);\n\tif (fnSelect.selectedIndex < first) {\n\t\tfnSelect.selectedIndex = first;\n\t}\n}\n\n/** Add new field in schema-less edit\n* @this HTMLInputElement\n*/\nfunction fieldChange() {\n\tconst row = cloneNode(parentTag(this, 'tr'));\n\tfor (const input of qsa('input', row)) {\n\t\tinput.value = '';\n\t}\n\t// keep value in <select> (function)\n\tparentTag(this, 'table').appendChild(row);\n\tthis.oninput = () => { };\n}\n\n\n\n/** Create AJAX request\n* @param string\n* @param function (XMLHttpRequest)\n* @param [string]\n* @param [string]\n* @return XMLHttpRequest or false in case of an error\n* @uses offlineMessage\n*/\nfunction ajax(url, callback, data, message) {\n\tconst request = new XMLHttpRequest();\n\tif (request) {\n\t\tconst ajaxStatus = qs('#ajaxstatus');\n\t\tif (message) {\n\t\t\tajaxStatus.innerHTML = '<div class=\"message\">' + message + '</div>';\n\t\t}\n\t\talterClass(ajaxStatus, 'hidden', !message);\n\t\trequest.open((data ? 'POST' : 'GET'), url);\n\t\tif (data) {\n\t\t\trequest.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');\n\t\t}\n\t\trequest.setRequestHeader('X-Requested-With', 'XMLHttpRequest');\n\t\trequest.onreadystatechange = () => {\n\t\t\tif (request.readyState == 4) {\n\t\t\t\tif (/^2/.test(request.status)) {\n\t\t\t\t\tcallback(request);\n\t\t\t\t} else if (message !== null) {\n\t\t\t\t\tajaxStatus.innerHTML = (request.status ? request.responseText : '<div class=\"error\">' + offlineMessage + '</div>');\n\t\t\t\t\talterClass(ajaxStatus, 'hidden');\n\t\t\t\t}\n\t\t\t}\n\t\t};\n\t\trequest.send(data);\n\t}\n\treturn request;\n}\n\n/** Use setHtml(key, value) for JSON response\n* @param string\n* @return boolean false for success\n*/\nfunction ajaxSetHtml(url) {\n\treturn !ajax(url, request => {\n\t\tconst data = JSON.parse(request.responseText);\n\t\tfor (const key in data) {\n\t\t\tsetHtml(key, data[key]);\n\t\t}\n\t});\n}\n\nlet editChanged; // used by plugins\nlet adminerHighlighter = els => {}; // overwritten by syntax highlighters\n\n/** Save form contents through AJAX\n* @param HTMLFormElement\n* @param string\n* @param [HTMLInputElement]\n* @return boolean\n*/\nfunction ajaxForm(form, message, button) {\n\tlet data = [];\n\tfor (const el of form.elements) {\n\t\tif (el.name && !el.disabled) {\n\t\t\tif (/^file\$/i.test(el.type) && el.value) {\n\t\t\t\treturn false;\n\t\t\t}\n\t\t\tif (!/^(checkbox|radio|submit|file)\$/i.test(el.type) || el.checked || el == button) {\n\t\t\t\tdata.push(encodeURIComponent(el.name) + '=' + encodeURIComponent(isTag(el, 'select') ? selectValue(el) : el.value));\n\t\t\t}\n\t\t}\n\t}\n\tdata = data.join('&');\n\n\tlet url = form.action;\n\tif (!/post/i.test(form.method)) {\n\t\turl = url.replace(/\\?.*/, '') + '?' + data;\n\t\tdata = '';\n\t}\n\treturn ajax(url, request => {\n\t\tconst ajaxstatus = qs('#ajaxstatus');\n\t\tsetHtml('ajaxstatus', request.responseText);\n\t\tif (qs('.message', ajaxstatus)) { // success\n\t\t\teditChanged = null;\n\t\t}\n\t\tadminerHighlighter(qsa('code', ajaxstatus));\n\t\tmessagesPrint(ajaxstatus);\n\t}, data, message);\n}\n\n\n\n/** Display edit field\n* @param MouseEvent\n* @param number display textarea instead of input, 2 - load long text\n* @param [string] warning to display\n* @return boolean\n* @this HTMLElement\n*/\nfunction selectClick(event, text, warning) {\n\tconst td = this;\n\tconst target = event.target;\n\tif (!isCtrl(event) || isTag(td.firstChild, 'input|textarea') || isTag(target, 'a')) {\n\t\treturn;\n\t}\n\tif (warning) {\n\t\talert(warning);\n\t\treturn true;\n\t}\n\tconst original = td.innerHTML;\n\ttext = text || /\\n/.test(original);\n\tconst input = document.createElement(text ? 'textarea' : 'input');\n\tinput.onkeydown = event => {\n\t\tif (event.keyCode == 27 && !event.shiftKey && !event.altKey && !isCtrl(event)) { // 27 - Esc\n\t\t\tinputBlur.apply(input);\n\t\t\ttd.innerHTML = original;\n\t\t}\n\t};\n\n\tconst pos = getSelection().anchorOffset;\n\tlet value = (td.firstChild && td.firstChild.alt) || td.textContent;\n\tconst tdStyle = window.getComputedStyle(td, null);\n\n\tinput.style.width = Math.max(td.clientWidth - parseFloat(tdStyle.paddingLeft) - parseFloat(tdStyle.paddingRight), (text ? 200 : 20)) + 'px';\n\n\tif (text) {\n\t\tlet rows = 1;\n\t\tvalue.replace(/\\n/g, () => {\n\t\t\trows++;\n\t\t});\n\t\tinput.rows = rows;\n\t}\n\tif (qsa('i', td).length) { // <i> - NULL\n\t\tvalue = '';\n\t}\n\ttd.innerHTML = '';\n\ttd.appendChild(input);\n\tsetupSubmitHighlight(td);\n\tinput.focus();\n\tif (text == 2) { // long text\n\t\treturn ajax(location.href + '&' + encodeURIComponent(td.id) + '=', request => {\n\t\t\tif (request.responseText) {\n\t\t\t\tinput.value = request.responseText;\n\t\t\t\tinput.name = td.id;\n\t\t\t}\n\t\t});\n\t}\n\tinput.value = value;\n\tinput.name = td.id;\n\tinput.selectionStart = pos;\n\tinput.selectionEnd = pos;\n\treturn true;\n}\n\n\n\n/** Load and display next page in select\n* @param number\n* @param string\n* @return boolean false for success\n* @this HTMLLinkElement\n*/\nfunction selectLoadMore(limit, loading) {\n\tconst a = this;\n\tconst title = a.innerHTML;\n\tconst href = a.href;\n\ta.innerHTML = loading;\n\tif (href) {\n\t\ta.removeAttribute('href');\n\t\treturn !ajax(href, request => {\n\t\t\tconst tbody = document.createElement('tbody');\n\t\t\ttbody.innerHTML = request.responseText;\n\t\t\tadminerHighlighter(qsa('code', tbody));\n\t\t\tqs('#table').appendChild(tbody);\n\t\t\tif (tbody.children.length < limit) {\n\t\t\t\ta.remove();\n\t\t\t} else {\n\t\t\t\ta.href = href.replace(/\\d+\$/, page => +page + 1);\n\t\t\t\ta.innerHTML = title;\n\t\t\t}\n\t\t});\n\t}\n}\n\n\n\n/** Stop event propagation\n* @param Event\n*/\nfunction eventStop(event) {\n\tevent.stopPropagation();\n}\n\n\n\n/** Setup highlighting of default submit button on form field focus\n* @param HTMLElement\n*/\nfunction setupSubmitHighlight(parent) {\n\tfor (const input of qsa('input, select, textarea', parent)) {\n\t\tsetupSubmitHighlightInput(input);\n\t}\n}\n\n/** Setup submit highlighting for single element\n* @param HTMLElement\n*/\nfunction setupSubmitHighlightInput(input) {\n\tif (!/submit|button|image|file/.test(input.type)) {\n\t\taddEvent(input, 'focus', inputFocus);\n\t\taddEvent(input, 'blur', inputBlur);\n\t}\n}\n\n/** Highlight default submit button\n* @this HTMLInputElement\n*/\nfunction inputFocus() {\n\talterClass(findDefaultSubmit(this), 'default', true);\n}\n\n/** Unhighlight default submit button\n* @this HTMLInputElement\n*/\nfunction inputBlur() {\n\talterClass(findDefaultSubmit(this), 'default');\n}\n\n/** Find submit button used by Enter\n* @param HTMLElement\n* @return HTMLInputElement\n*/\nfunction findDefaultSubmit(el) {\n\tif (el.jushTextarea) {\n\t\tel = el.jushTextarea;\n\t}\n\tif (!el.form) {\n\t\treturn null;\n\t}\n\tfor (const input of qsa('input', el.form)) {\n\t\tif (input.type == 'submit' && !input.style.zIndex) {\n\t\t\treturn input;\n\t\t}\n\t}\n}\n\n\n\n/** Add event listener\n* @param HTMLElement\n* @param string without 'on'\n* @param function\n*/\nfunction addEvent(el, action, handler) {\n\tel.addEventListener(action, handler, false);\n}\n\n/** Clone node and setup submit highlighting\n* @param HTMLElement\n* @return HTMLElement\n*/\nfunction cloneNode(el) {\n\tconst el2 = el.cloneNode(true);\n\tconst selector = 'input, select';\n\tconst origEls = qsa(selector, el);\n\tconst cloneEls = qsa(selector, el2);\n\tfor (let i=0; i < origEls.length; i++) {\n\t\tconst origEl = origEls[i];\n\t\tfor (const key in origEl) {\n\t\t\tif (/^on/.test(key) && origEl[key]) {\n\t\t\t\tcloneEls[i][key] = origEl[key];\n\t\t\t}\n\t\t}\n\t}\n\tsetupSubmitHighlight(el2);\n\treturn el2;\n}\n\noninput = event => {\n\tconst target = event.target;\n\tconst maxLength = target.dataset.maxlength;\n\talterClass(target, 'maxlength', target.value && maxLength != null && target.value.length > maxLength); // maxLength could be 0\n};\n\naddEvent(document, 'click', event => {\n\tif (!qs('#foot').contains(event.target)) {\n\t\talterClass(qs('#foot'), 'foot', true);\n\t}\n});\n'use strict'; // Adminer specific functions\n\nlet autocompleter; // set in adminer.inc.php\n\n/** Load syntax highlighting\n* @param string first three characters of database system version\n* @param [string]\n*/\nfunction syntaxHighlighting(version, vendor) {\n\taddEventListener('DOMContentLoaded', () => {\n\t\tif (window.jush) {\n\t\t\tjush.create_links = 'target=\"_blank\" rel=\"noreferrer noopener\"';\n\t\t\tif (version) {\n\t\t\t\tfor (let key in jush.urls) {\n\t\t\t\t\tlet obj = jush.urls;\n\t\t\t\t\tif (typeof obj[key] != 'string') {\n\t\t\t\t\t\tobj = obj[key];\n\t\t\t\t\t\tkey = 0;\n\t\t\t\t\t\tif (vendor == 'maria') {\n\t\t\t\t\t\t\tfor (let i = 1; i < obj.length; i++) {\n\t\t\t\t\t\t\t\tobj[i] = obj[i]\n\t\t\t\t\t\t\t\t\t.replace('.html', '/')\n\t\t\t\t\t\t\t\t\t.replace('-type-syntax', '-data-types')\n\t\t\t\t\t\t\t\t\t.replace(/numeric-(data-types)/, '\$1-\$&')\n\t\t\t\t\t\t\t\t\t.replace(/replication-options-(master|binary-log)\\//, 'replication-and-binary-log-system-variables/')\n\t\t\t\t\t\t\t\t\t.replace('server-options/', 'server-system-variables/')\n\t\t\t\t\t\t\t\t\t.replace('innodb-parameters/', 'innodb-system-variables/')\n\t\t\t\t\t\t\t\t\t.replace(/#(statvar|sysvar|option_mysqld)_(.*)/, '#\$2')\n\t\t\t\t\t\t\t\t\t.replace(/#sysvar_(.*)/, '#\$1')\n\t\t\t\t\t\t\t\t;\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\n\t\t\t\t\tobj[key] = (vendor == 'maria' ? obj[key].replace('dev.mysql.com/doc/mysql', 'mariadb.com/kb') : obj[key]) // MariaDB\n\t\t\t\t\t\t.replace('/doc/mysql', '/doc/refman/' + version) // MySQL\n\t\t\t\t\t;\n\t\t\t\t\tif (vendor != 'cockroach') {\n\t\t\t\t\t\tobj[key] = obj[key].replace('/docs/current', '/docs/' + version); // PostgreSQL\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (window.jushLinks) {\n\t\t\t\tjush.custom_links = jushLinks;\n\t\t\t}\n\t\t\tjush.highlight_tag('code', 0);\n\t\t\tadminerHighlighter = els => jush.highlight_tag(els, 0);\n\t\t\tfor (const tag of qsa('textarea')) {\n\t\t\t\tif (/(^|\\s)jush-/.test(tag.className)) {\n\t\t\t\t\tconst pre = jush.textarea(tag, autocompleter);\n\t\t\t\t\tif (pre) {\n\t\t\t\t\t\tsetupSubmitHighlightInput(pre);\n\t\t\t\t\t\ttag.onchange = () => {\n\t\t\t\t\t\t\tpre.textContent = tag.value;\n\t\t\t\t\t\t\tpre.oninput();\n\t\t\t\t\t\t};\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t});\n}\n\n/** Get value of dynamically created form field\n* @param HTMLFormElement\n* @param string\n* @return HTMLElement\n*/\nfunction formField(form, name) {\n\t// required in IE < 8, form.elements[name] doesn't work\n\tfor (let i=0; i < form.length; i++) {\n\t\tif (form[i].name == name) {\n\t\t\treturn form[i];\n\t\t}\n\t}\n}\n\n/** Try to change input type to password or to text\n* @param HTMLInputElement\n* @param boolean\n*/\nfunction typePassword(el, disable) {\n\ttry {\n\t\tel.type = (disable ? 'text' : 'password');\n\t} catch (e) { // empty\n\t}\n}\n\n/** Install toggle handler\n* @param [HTMLElement]\n*/\nfunction messagesPrint(parent) {\n\tfor (const el of qsa('.toggle', parent)) {\n\t\tel.onclick = partial(toggle, el.getAttribute('href').substr(1));\n\t}\n\tfor (const el of qsa('.copy', parent)) {\n\t\tel.onclick = () => {\n\t\t\tnavigator.clipboard.writeText(qs('code', el.parentElement).innerText).then(() => el.textContent = '\xe2\x9c\x93');\n\t\t\tsetTimeout(() => el.textContent = '\xf0\x9f\x97\x90', 1000);\n\t\t\treturn false;\n\t\t};\n\t}\n}\n\n\n\n/** Hide or show some login rows for selected driver\n* @param HTMLSelectElement\n*/\nfunction loginDriver(driver) {\n\tconst trs = parentTag(driver, 'table').rows;\n\tconst disabled = /sqlite/.test(selectValue(driver));\n\talterClass(trs[1], 'hidden', disabled);\t// 1 - row with server\n\ttrs[1].getElementsByTagName('input')[0].disabled = disabled;\n}\n\n\n\nlet dbCtrl;\nconst dbPrevious = {};\n\n/** Check if database should be opened to a new window\n* @param MouseEvent\n* @this HTMLSelectElement\n*/\nfunction dbMouseDown(event) {\n\t// Firefox: mouse-down event does not contain pressed key information for OPTION.\n\t// Chrome: mouse-down event has inherited key information from SELECT.\n\t// So we ignore the event for OPTION to work Ctrl+click correctly everywhere.\n\tif (event.target.tagName == \"OPTION\") {\n\t\treturn;\n\t}\n\n\tdbCtrl = isCtrl(event);\n\tif (dbPrevious[this.name] == undefined) {\n\t\tdbPrevious[this.name] = this.value;\n\t}\n}\n\n/** Load database after selecting it\n* @this HTMLSelectElement\n*/\nfunction dbChange() {\n\tif (dbCtrl) {\n\t\tthis.form.target = '_blank';\n\t}\n\tthis.form.submit();\n\tthis.form.target = '';\n\tif (dbCtrl && dbPrevious[this.name] != undefined) {\n\t\tthis.value = dbPrevious[this.name];\n\t\tdbPrevious[this.name] = undefined;\n\t}\n}\n\n\n\n/** Check whether the query will be executed with index\n* @this HTMLElement\n*/\nfunction selectFieldChange() {\n\tconst form = this.form;\n\tconst ok = (() => {\n\t\tfor (const input of qsa('input', form)) {\n\t\t\tif (input.value && /^fulltext/.test(input.name)) {\n\t\t\t\treturn true;\n\t\t\t}\n\t\t}\n\t\tlet ok = form.limit.value;\n\t\tlet group = false;\n\t\tconst columns = {};\n\t\tfor (const select of qsa('select', form)) {\n\t\t\tconst col = selectValue(select);\n\t\t\tlet match = /^(where.+)col]/.exec(select.name);\n\t\t\tif (match) {\n\t\t\t\tconst op = selectValue(form[match[1] + 'op]']);\n\t\t\t\tconst val = form[match[1] + 'val]'].value;\n\t\t\t\tif (col in indexColumns && (!/LIKE|REGEXP/.test(op) || (op == 'LIKE' && val.charAt(0) != '%'))) {\n\t\t\t\t\treturn true;\n\t\t\t\t} else if (col || val) {\n\t\t\t\t\tok = false;\n\t\t\t\t}\n\t\t\t}\n\t\t\tif ((match = /^(columns.+)fun]/.exec(select.name))) {\n\t\t\t\tif (/^(avg|count|count distinct|group_concat|max|min|sum)\$/.test(col)) {\n\t\t\t\t\tgroup = true;\n\t\t\t\t}\n\t\t\t\tconst val = selectValue(form[match[1] + 'col]']);\n\t\t\t\tif (val) {\n\t\t\t\t\tcolumns[col && col != 'count' ? '' : val] = 1;\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (col && /^order/.test(select.name)) {\n\t\t\t\tif (!(col in indexColumns)) {\n\t\t\t\t\tok = false;\n\t\t\t\t}\n\t\t\t\tbreak;\n\t\t\t}\n\t\t}\n\t\tif (group) {\n\t\t\tfor (const col in columns) {\n\t\t\t\tif (!(col in indexColumns)) {\n\t\t\t\t\tok = false;\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\treturn ok;\n\t})();\n\tsetHtml('noindex', (ok ? '' : '!'));\n}\n\n\n\nlet added = '.', rowCount;\n\n/** Check if val is equal to a-delimiter-b where delimiter is '_', '' or big letter\n* @param string\n* @param string\n* @param string\n* @return boolean\n*/\nfunction delimiterEqual(val, a, b) {\n\treturn (val == a + '_' + b || val == a + b || val == a + b.charAt(0).toUpperCase() + b.substr(1));\n}\n\n/** Escape string to use as identifier\n* @param string\n* @return string\n*/\nfunction idfEscape(s) {\n\treturn s.replace(/`/, '``');\n}\n\n\n\n/** Set up event handlers for edit_fields().\n*/\nfunction editFields() {\n\tfor (const el of qsa('[name\$=\"[field]\"]')) {\n\t\tel.oninput = function () {\n\t\t\teditingNameChange.call(this);\n\t\t\tif (!this.defaultValue) {\n\t\t\t\teditingAddRow.call(this);\n\t\t\t}\n\t\t};\n\t}\n\tfor (const el of qsa('[name\$=\"[length]\"]')) {\n\t\tmixin(el, {onfocus: editingLengthFocus, oninput: editingLengthChange});\n\t}\n\tfor (const el of qsa('[name\$=\"[type]\"]')) {\n\t\tmixin(el, {\n\t\t\tonfocus: function () {\n\t\t\t\tlastType = selectValue(this);\n\t\t\t},\n\t\t\tonchange: editingTypeChange,\n\t\t\tonmouseover: function (event) {\n\t\t\t\thelpMouseover.call(this, event, event.target.value, 1);\n\t\t\t},\n\t\t\tonmouseout: helpMouseout\n\t\t});\n\t}\n}\n\n/** Handle clicks on fields editing\n* @param MouseEvent\n* @return boolean false to cancel action\n*/\nfunction editingClick(event) {\n\tlet el = parentTag(event.target, 'button');\n\tif (el) {\n\t\tconst name = el.name;\n\t\tif (/^add\\[/.test(name)) {\n\t\t\teditingAddRow.call(el, 1);\n\t\t} else if (/^up\\[/.test(name)) {\n\t\t\teditingMoveRow.call(el, 1);\n\t\t} else if (/^down\\[/.test(name)) {\n\t\t\teditingMoveRow.call(el);\n\t\t} else if (/^drop_col\\[/.test(name)) {\n\t\t\teditingRemoveRow.call(el, 'fields\$1[field]');\n\t\t}\n\t\treturn false;\n\t}\n\tel = event.target;\n\tif (!isTag(el, 'input')) {\n\t\tel = parentTag(el, 'label');\n\t\tel = el && qs('input', el);\n\t}\n\tif (el) {\n\t\tconst name = el.name;\n\t\tif (name == 'auto_increment_col') {\n\t\t\tconst field = el.form['fields[' + el.value + '][field]'];\n\t\t\tif (!field.value) {\n\t\t\t\tfield.value = 'id';\n\t\t\t\tfield.oninput();\n\t\t\t}\n\t\t}\n\t}\n}\n\n/** Handle input on fields editing\n* @param InputEvent\n*/\nfunction editingInput(event) {\n\tconst el = event.target;\n\tif (/\\[default]\$/.test(el.name)) {\n\t\t el.previousElementSibling.checked = true;\n\t\t el.previousElementSibling.selectedIndex = Math.max(el.previousElementSibling.selectedIndex, 1);\n\t}\n}\n\n/** Detect foreign key\n* @this HTMLInputElement\n*/\nfunction editingNameChange() {\n\tconst name = this.name.substr(0, this.name.length - 7);\n\tconst type = formField(this.form, name + '[type]');\n\tconst opts = type.options;\n\tlet candidate; // don't select anything with ambiguous match (like column `id`)\n\tconst val = this.value;\n\tfor (let i = opts.length; i--; ) {\n\t\tconst match = /(.+)`(.+)/.exec(opts[i].value);\n\t\tif (!match) { // common type\n\t\t\tif (candidate && i == opts.length - 2 && val == opts[candidate].value.replace(/.+`/, '') && name == 'fields[1]') { // single target table, link to column, first field - probably `id`\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tbreak;\n\t\t}\n\t\tconst base = match[1];\n\t\tconst column = match[2];\n\t\tfor (const table of [ base, base.replace(/s\$/, ''), base.replace(/es\$/, '') ]) {\n\t\t\tif (val == column || val == table || delimiterEqual(val, table, column) || delimiterEqual(val, column, table)) {\n\t\t\t\tif (candidate) {\n\t\t\t\t\treturn;\n\t\t\t\t}\n\t\t\t\tcandidate = i;\n\t\t\t\tbreak;\n\t\t\t}\n\t\t}\n\t}\n\tif (candidate) {\n\t\ttype.selectedIndex = candidate;\n\t\ttype.onchange();\n\t}\n}\n\n/** Add table row for next field\n* @param [boolean]\n* @return boolean false\n* @this HTMLInputElement\n*/\nfunction editingAddRow(focus) {\n\tconst match = /(\\d+)(\\.\\d+)?/.exec(this.name);\n\tconst x = match[0] + (match[2] ? added.substr(match[2].length) : added) + '1';\n\tconst row = parentTag(this, 'tr');\n\tconst row2 = cloneNode(row);\n\tlet tags = qsa('select, input, button', row);\n\tlet tags2 = qsa('select, input, button', row2);\n\tfor (let i=0; i < tags.length; i++) {\n\t\ttags2[i].name = tags[i].name.replace(/[0-9.]+/, x);\n\t\ttags2[i].selectedIndex = (/\\[(generated)/.test(tags[i].name) ? 0 : tags[i].selectedIndex);\n\t}\n\ttags = qsa('input', row);\n\ttags2 = qsa('input', row2);\n\tconst input = tags2[0]; // IE loose tags2 after insertBefore()\n\tfor (let i=0; i < tags.length; i++) {\n\t\tif (tags[i].name == 'auto_increment_col') {\n\t\t\ttags2[i].value = x;\n\t\t\ttags2[i].checked = false;\n\t\t}\n\t\tif (/\\[(orig|field|comment|default)/.test(tags[i].name)) {\n\t\t\ttags2[i].value = '';\n\t\t}\n\t\tif (/\\[(generated)/.test(tags[i].name)) {\n\t\t\ttags2[i].checked = false;\n\t\t}\n\t}\n\ttags[0].oninput = editingNameChange;\n\trow.parentNode.insertBefore(row2, row.nextSibling);\n\tif (focus) {\n\t\tinput.oninput = editingNameChange;\n\t\tinput.focus();\n\t}\n\tadded += '0';\n\trowCount++;\n\treturn false;\n}\n\n/** Remove table row for field\n* @param string regular expression replacement\n* @return boolean false\n* @this HTMLInputElement\n*/\nfunction editingRemoveRow(name) {\n\tconst field = formField(this.form, this.name.replace(/[^[]+(.+)/, name));\n\tfield.remove();\n\tparentTag(this, 'tr').style.display = 'none';\n\treturn false;\n}\n\n/** Move table row for field\n* @param [boolean]\n* @return boolean false for success\n* @this HTMLInputElement\n*/\nfunction editingMoveRow(up){\n\tconst row = parentTag(this, 'tr');\n\tif (!('nextElementSibling' in row)) {\n\t\treturn true;\n\t}\n\trow.parentNode.insertBefore(row, up\n\t\t? row.previousElementSibling\n\t\t: row.nextElementSibling ? row.nextElementSibling.nextElementSibling : row.parentNode.firstChild);\n\treturn false;\n}\n\nlet lastType = '';\n\n/** Clear length and hide collation or unsigned\n* @this HTMLSelectElement\n*/\nfunction editingTypeChange() {\n\tconst type = this;\n\tconst name = type.name.substr(0, type.name.length - 6);\n\tconst text = selectValue(type);\n\tfor (const el of type.form.elements) {\n\t\tif (el.name == name + '[length]') {\n\t\t\tif (!(\n\t\t\t\t(/(char|binary)\$/.test(lastType) && /(char|binary)\$/.test(text))\n\t\t\t\t|| (/(enum|set)\$/.test(lastType) && /(enum|set)\$/.test(text))\n\t\t\t)) {\n\t\t\t\tel.value = '';\n\t\t\t}\n\t\t\tel.oninput.apply(el);\n\t\t}\n\t\tif (lastType == 'timestamp' && el.name == name + '[generated]' && /timestamp/i.test(formField(type.form, name + '[default]').value)) {\n\t\t\tel.checked = false;\n\t\t\tel.selectedIndex = 0;\n\t\t}\n\t\tif (el.name == name + '[collation]') {\n\t\t\talterClass(el, 'hidden', !/(char|text|enum|set)\$/.test(text));\n\t\t}\n\t\tif (el.name == name + '[unsigned]') {\n\t\t\talterClass(el, 'hidden', !/(^|[^o])int(?!er)|numeric|real|float|double|decimal|money/.test(text));\n\t\t}\n\t\tif (el.name == name + '[on_update]') {\n\t\t\talterClass(el, 'hidden', !/timestamp|datetime/.test(text)); // MySQL supports datetime since 5.6.5\n\t\t}\n\t\tif (el.name == name + '[on_delete]') {\n\t\t\talterClass(el, 'hidden', !/`/.test(text));\n\t\t}\n\t}\n\thelpClose();\n}\n\n/** Mark length as required\n* @this HTMLInputElement\n*/\nfunction editingLengthChange() {\n\talterClass(this, 'required', !this.value.length && /var(char|binary)\$/.test(selectValue(this.parentNode.previousSibling.firstChild)));\n}\n\n/** Edit enum or set\n* @this HTMLInputElement\n*/\nfunction editingLengthFocus() {\n\tconst td = this.parentNode;\n\tif (/^(enum|set)\$/.test(selectValue(td.previousSibling.firstChild))) {\n\t\tconst edit = qs('#enum-edit');\n\t\tedit.value = enumValues(this.value);\n\t\ttd.appendChild(edit);\n\t\tthis.style.display = 'none';\n\t\tedit.style.display = 'inline';\n\t\tedit.focus();\n\t}\n}\n\n/** Get enum values\n* @param string\n* @return string values separated by newlines\n*/\nfunction enumValues(s) {\n\tconst re = /(^|,)\\s*'(([^\\\\']|\\\\.|'')*)'\\s*/g;\n\tconst result = [];\n\tlet offset = 0;\n\tlet match;\n\twhile ((match = re.exec(s))) {\n\t\tif (offset != match.index) {\n\t\t\tbreak;\n\t\t}\n\t\tresult.push(match[2].replace(/'(')|\\\\(.)/g, '\$1\$2'));\n\t\toffset += match[0].length;\n\t}\n\treturn (offset == s.length ? result.join('\\n') : s);\n}\n\n/** Finish editing of enum or set\n* @this HTMLTextAreaElement\n*/\nfunction editingLengthBlur() {\n\tconst field = this.parentNode.firstChild;\n\tconst val = this.value;\n\tfield.value = (/^'[^\\n]+'\$/.test(val) ? val : val && \"'\" + val.replace(/\\n+\$/, '').replace(/'/g, \"''\").replace(/\\\\/g, '\\\\\\\\').replace(/\\n/g, \"','\") + \"'\");\n\tfield.style.display = 'inline';\n\tthis.style.display = 'none';\n}\n\n/** Show or hide selected table column\n* @param boolean\n* @param number\n*/\nfunction columnShow(checked, column) {\n\tfor (const tr of qsa('tr', qs('#edit-fields'))) {\n\t\talterClass(qsa('td', tr)[column], 'hidden', !checked);\n\t}\n}\n\n/** Show or hide index column options\n* @param boolean\n*/\nfunction indexOptionsShow(checked) {\n\tfor (const option of qsa('.idxopts')) {\n\t\talterClass(option, 'hidden', !checked);\n\t}\n}\n\n/** Display partition options\n* @this HTMLSelectElement\n*/\nfunction partitionByChange() {\n\tconst partitionTable = /RANGE|LIST/.test(selectValue(this));\n\talterClass(this.form['partitions'], 'hidden', partitionTable || !this.selectedIndex);\n\talterClass(qs('#partition-table'), 'hidden', !partitionTable);\n\thelpClose();\n}\n\n/** Add next partition row\n* @this HTMLInputElement\n*/\nfunction partitionNameChange() {\n\tconst row = cloneNode(parentTag(this, 'tr'));\n\trow.firstChild.firstChild.value = '';\n\tparentTag(this, 'table').appendChild(row);\n\tthis.oninput = () => { };\n}\n\n/** Show or hide comment fields\n* @param HTMLInputElement\n* @param [boolean] whether to focus Comment if checked\n*/\nfunction editingCommentsClick(el, focus) {\n\tconst comment = el.form['Comment'];\n\tcolumnShow(el.checked, 6);\n\talterClass(comment, 'hidden', !el.checked);\n\tif (focus && el.checked) {\n\t\tcomment.focus();\n\t}\n}\n\n\n\n/** Uncheck 'all' checkbox\n* @param MouseEvent\n* @this HTMLTableElement\n*/\nfunction dumpClick(event) {\n\tlet el = parentTag(event.target, 'label');\n\tif (el) {\n\t\tel = qs('input', el);\n\t\tconst match = /(.+)\\[]\$/.exec(el.name);\n\t\tif (match) {\n\t\t\tcheckboxClick.call(el, event);\n\t\t\tformUncheck('check-' + match[1]);\n\t\t}\n\t}\n}\n\n\n\n/** Add row for foreign key\n* @this HTMLSelectElement\n*/\nfunction foreignAddRow() {\n\tconst row = cloneNode(parentTag(this, 'tr'));\n\tthis.onchange = () => { };\n\tfor (const select of qsa('select', row)) {\n\t\tselect.name = select.name.replace(/\\d+]/, '1\$&');\n\t\tselect.selectedIndex = 0;\n\t}\n\tparentTag(this, 'table').appendChild(row);\n}\n\n\n\n/** Add row for indexes\n* @this HTMLSelectElement\n*/\nfunction indexesAddRow() {\n\tconst row = cloneNode(parentTag(this, 'tr'));\n\tthis.onchange = () => { };\n\tfor (const select of qsa('select', row)) {\n\t\tselect.name = select.name.replace(/indexes\\[\\d+/, '\$&1');\n\t\tselect.selectedIndex = 0;\n\t}\n\tfor (const input of qsa('input', row)) {\n\t\tinput.name = input.name.replace(/indexes\\[\\d+/, '\$&1');\n\t\tinput.value = '';\n\t}\n\tparentTag(this, 'table').appendChild(row);\n}\n\n/** Change column in index\n* @param string name prefix\n* @this HTMLSelectElement\n*/\nfunction indexesChangeColumn(prefix) {\n\tconst names = [];\n\tfor (const tag in { 'select': 1, 'input': 1 }) {\n\t\tfor (const column of qsa(tag, parentTag(this, 'td'))) {\n\t\t\tif (/\\[columns]/.test(column.name)) {\n\t\t\t\tconst value = selectValue(column);\n\t\t\t\tif (value) {\n\t\t\t\t\tnames.push(value);\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\tthis.form[this.name.replace(/].*/, '][name]')].value = prefix + names.join('_');\n}\n\n/** Add column for index\n* @param string name prefix\n* @this HTMLSelectElement\n*/\nfunction indexesAddColumn(prefix) {\n\tconst field = this;\n\tconst select = field.form[field.name.replace(/].*/, '][type]')];\n\tif (!select.selectedIndex) {\n\t\twhile (selectValue(select) != \"INDEX\" && select.selectedIndex < select.options.length) {\n\t\t\tselect.selectedIndex++;\n\t\t}\n\t\tselect.onchange();\n\t}\n\tconst column = cloneNode(field.parentNode);\n\tfor (const select of qsa('select', column)) {\n\t\tselect.name = select.name.replace(/]\\[\\d+/, '\$&1');\n\t\tselect.selectedIndex = 0;\n\t}\n\tfield.onchange = partial(indexesChangeColumn, prefix);\n\tfor (const input of qsa('input', column)) {\n\t\tinput.name = input.name.replace(/]\\[\\d+/, '\$&1');\n\t\tif (input.type != 'checkbox') {\n\t\t\tinput.value = '';\n\t\t}\n\t}\n\tparentTag(field, 'td').appendChild(column);\n\tfield.onchange();\n}\n\n\n\n/** Update the form action\n* @param HTMLFormElement\n* @param string\n*/\nfunction sqlSubmit(form, root) {\n\tconst action = root\n\t\t+ '&sql=' + encodeURIComponent(form['query'].value)\n\t\t+ (form['limit'].value ? '&limit=' + +form['limit'].value : '')\n\t\t+ (form['error_stops'].checked ? '&error_stops=1' : '')\n\t\t+ (form['only_errors'].checked ? '&only_errors=1' : '')\n\t;\n\tif ((document.location.origin + document.location.pathname + action).length < 2000) { // reasonable minimum is 2048\n\t\tform.action = action;\n\t}\n}\n\n/** Check if PHP can handle the uploaded files\n* @param Event\n* @param number\n* @param string\n* @param number\n* @param string\n*/\nfunction fileChange(event, count, countMessage, size, sizeMessage) {\n\tif (event.target.files.length > count) {\n\t\talert(countMessage);\n\t} else if (Array.from(event.target.files).reduce((sum, file) => sum + file.size, 0) > size) {\n\t\talert(sizeMessage);\n\t}\n}\n\n\n\n/** Handle changing trigger time or event\n* @param RegExp\n* @param string\n* @param HTMLFormElement\n*/\nfunction triggerChange(tableRe, table, form) {\n\tconst formEvent = selectValue(form['Event']);\n\tif (tableRe.test(form['Trigger'].value)) {\n\t\tform['Trigger'].value = table + '_' + (selectValue(form['Timing']).charAt(0) + formEvent.charAt(0)).toLowerCase();\n\t}\n\talterClass(form['Of'], 'hidden', !/ OF/.test(formEvent));\n}\n\n\n\nlet that, x, y; // em and tablePos defined in schema.inc.php\n\n/** Get mouse position\n* @param MouseEvent\n* @this HTMLElement\n*/\nfunction schemaMousedown(event) {\n\tif ((event.which || event.button) == 1) {\n\t\tthat = this;\n\t\tx = event.clientX - this.offsetLeft;\n\t\ty = event.clientY - this.offsetTop;\n\t}\n}\n\n/** Move object\n* @param MouseEvent\n*/\nfunction schemaMousemove(event) {\n\tif (that !== undefined) {\n\t\tconst left = (event.clientX - x) / em;\n\t\tconst top = (event.clientY - y) / em;\n\t\tconst lineSet = { };\n\t\tfor (const div of qsa('div', that)) {\n\t\t\tif (div.classList.contains('references')) {\n\t\t\t\tconst div2 = qs('[id=\"' + (/^refs/.test(div.id) ? 'refd' : 'refs') + div.id.substr(4) + '\"]');\n\t\t\t\tconst ref = (tablePos[div.title] || [ div2.parentNode.offsetTop / em, 0 ]);\n\t\t\t\tlet left1 = -1;\n\t\t\t\tconst id = div.id.replace(/^ref.(.+)-.+/, '\$1');\n\t\t\t\tif (div.parentNode != div2.parentNode) {\n\t\t\t\t\tleft1 = Math.min(0, ref[1] - left) - 1;\n\t\t\t\t\tdiv.style.left = left1 + 'em';\n\t\t\t\t\tdiv.querySelector('div').style.width = -left1 + 'em';\n\t\t\t\t\tconst left2 = Math.min(0, left - ref[1]) - 1;\n\t\t\t\t\tdiv2.style.left = left2 + 'em';\n\t\t\t\t\tdiv2.querySelector('div').style.width = -left2 + 'em';\n\t\t\t\t}\n\t\t\t\tif (!lineSet[id]) {\n\t\t\t\t\tconst line = qs('[id=\"' + div.id.replace(/^....(.+)-.+\$/, 'refl\$1') + '\"]');\n\t\t\t\t\tconst top1 = top + div.offsetTop / em;\n\t\t\t\t\tlet top2 = top + div2.offsetTop / em;\n\t\t\t\t\tif (div.parentNode != div2.parentNode) {\n\t\t\t\t\t\ttop2 += ref[0] - top;\n\t\t\t\t\t\tline.querySelector('div').style.height = Math.abs(top1 - top2) + 'em';\n\t\t\t\t\t}\n\t\t\t\t\tline.style.left = (left + left1) + 'em';\n\t\t\t\t\tline.style.top = Math.min(top1, top2) + 'em';\n\t\t\t\t\tlineSet[id] = true;\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tthat.style.left = left + 'em';\n\t\tthat.style.top = top + 'em';\n\t}\n}\n\n/** Finish move\n* @param MouseEvent\n* @param string\n*/\nfunction schemaMouseup(event, db) {\n\tif (that !== undefined) {\n\t\ttablePos[that.firstChild.firstChild.firstChild.data] = [ (event.clientY - y) / em, (event.clientX - x) / em ];\n\t\tthat = undefined;\n\t\tlet s = '';\n\t\tfor (const key in tablePos) {\n\t\t\ts += '_' + key + ':' + Math.round(tablePos[key][0]) + 'x' + Math.round(tablePos[key][1]);\n\t\t}\n\t\ts = encodeURIComponent(s.substr(1));\n\t\tconst link = qs('#schema-link');\n\t\tlink.href = link.href.replace(/[^=]+\$/, '') + s;\n\t\tcookie('adminer_schema-' + db + '=' + s, 30); //! special chars in db\n\t}\n}\n\n\n\nlet helpOpen, helpIgnore; // when mouse outs <option> then it mouse overs border of <select> - ignore it\n\n/** Display help\n* @param MouseEvent\n* @param string\n* @param bool display on left side (otherwise on top)\n* @this HTMLElement\n*/\nfunction helpMouseover(event, text, side) {\n\tconst target = event.target;\n\tif (!text) {\n\t\thelpClose();\n\t} else if (window.jush && (!helpIgnore || this != target)) {\n\t\thelpOpen = 1;\n\t\tconst help = qs('#help');\n\t\thelp.innerHTML = text;\n\t\tjush.highlight_tag([ help ]);\n\t\talterClass(help, 'hidden');\n\t\tconst rect = target.getBoundingClientRect();\n\t\tconst body = document.documentElement;\n\t\thelp.style.top = (body.scrollTop + rect.top - (side ? (help.offsetHeight - target.offsetHeight) / 2 : help.offsetHeight)) + 'px';\n\t\thelp.style.left = (body.scrollLeft + rect.left - (side ? help.offsetWidth : (help.offsetWidth - target.offsetWidth) / 2)) + 'px';\n\t}\n}\n\n/** Close help after timeout\n* @param MouseEvent\n* @this HTMLElement\n*/\nfunction helpMouseout(event) {\n\thelpOpen = 0;\n\thelpIgnore = (this != event.target);\n\tsetTimeout(() => {\n\t\tif (!helpOpen) {\n\t\t\thelpClose();\n\t\t}\n\t}, 200);\n}\n\n/** Close help\n*/\nfunction helpClose() {\n\talterClass(qs('#help'), 'hidden', true);\n}\n";
 } elseif ($_GET["file"] == "jush.js") {
 	header("Content-Type: text/javascript; charset=utf-8");
-	echo "/** JUSH - JavaScript Syntax Highlighter\n* @link https://jush.sourceforge.io/\n* @author Jakub Vrana, https://www.vrana.cz\n* @copyright 2007 Jakub Vrana\n* @license https://www.apache.org/licenses/LICENSE-2.0 Apache License, Version 2.0\n*/\n\n/* Limitations:\n<style> and <script> supposes CDATA or HTML comments\nunnecessary escaping (e.g. echo \"\\'\" or ='&quot;') is removed\n*/\n\nvar jush = {\n\tcreate_links: true, // string for extra <a> parameters, e.g. 'target=\"_blank\"'\n\ttimeout: 1000, // milliseconds\n\tcustom_links: { }, // { state: { url: regexp } }, for example { php : { 'doc/\$&.html': /\\b(getData|setData)\\b/g } }\n\tapi: { }, // { state: { function: description } }, for example { php: { array: 'Create an array' } }\n\n\tphp: /<\\?(?!xml)(?:php)?|<script\\s+language\\s*=\\s*(?:\"php\"|'php'|php)\\s*>/i, // asp_tags=0, short_open_tag=1\n\tnum: /(?:0x[0-9a-f]+)|(?:\\b[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:e[+-]?[0-9]+)?/i,\n\n\tregexps: undefined,\n\tsubpatterns: { },\n\n\t/** Link stylesheet\n\t* @param string\n\t* @param [string]\n\t*/\n\tstyle: function (href, media) {\n\t\tvar link = document.createElement('link');\n\t\tlink.rel = 'stylesheet';\n\t\tif (media) {\n\t\t\tlink.media = media;\n\t\t}\n\t\tlink.href = href;\n\t\tdocument.getElementsByTagName('head')[0].appendChild(link);\n\t},\n\n\t/** Highlight text\n\t* @param string\n\t* @param string\n\t* @return string\n\t*/\n\thighlight: function (language, text) {\n\t\tthis.last_tag = '';\n\t\tthis.last_class = '';\n\t\treturn this.highlight_states([ language ], text.replace(/\\r\\n?/g, '\\n'), !/^(htm|tag|xml|txt)\$/.test(language))[0];\n\t},\n\n\t/** Highlight html\n\t* @param string\n\t* @param string\n\t* @return string\n\t*/\n\thighlight_html: function (language, html) {\n\t\tvar original = html.replace(/<br(\\s+[^>]*)?>/gi, '\\n');\n\t\tvar highlighted = jush.highlight(language, jush.html_entity_decode(original.replace(/<[^>]*>/g, '')));\n\n\t\tvar inject = { };\n\t\tvar pos = 0;\n\t\tvar last_offset = 0;\n\t\toriginal.replace(/(&[^;]+;)|(?:<[^>]+>)+/g, function (str, entity, offset) {\n\t\t\tpos += (offset - last_offset) + (entity ? 1 : 0);\n\t\t\tif (!entity) {\n\t\t\t\tinject[pos] = str;\n\t\t\t}\n\t\t\tlast_offset = offset + str.length;\n\t\t});\n\n\t\tpos = 0;\n\t\thighlighted = highlighted.replace(/([^&<]*)(?:(&[^;]+;)|(?:<[^>]+>)+|\$)/g, function (str, text, entity) {\n\t\t\tfor (var i = text.length; i >= 0; i--) {\n\t\t\t\tif (inject[pos + i]) {\n\t\t\t\t\tstr = str.substr(0, i) + inject[pos + i] + str.substr(i);\n\t\t\t\t\tdelete inject[pos + i];\n\t\t\t\t}\n\t\t\t}\n\t\t\tpos += text.length + (entity ? 1 : 0);\n\t\t\treturn str;\n\t\t});\n\t\treturn highlighted;\n\t},\n\n\t/** Highlight text in tags\n\t* @param mixed tag name or array of HTMLElement\n\t* @param number number of spaces for tab, 0 for tab itself, defaults to 4\n\t*/\n\thighlight_tag: function (tag, tab_width) {\n\t\tvar pre = (typeof tag == 'string' ? document.getElementsByTagName(tag) : tag);\n\t\tvar tab = '';\n\t\tfor (var i = (tab_width !== undefined ? tab_width : 4); i--; ) {\n\t\t\ttab += ' ';\n\t\t}\n\t\tvar i = 0;\n\t\tvar highlight = function () {\n\t\t\tvar start = new Date();\n\t\t\twhile (i < pre.length) {\n\t\t\t\tvar match = /(^|\\s)(?:jush|language(?=-\\S))(\$|\\s|-(\\S+))/.exec(pre[i].className); // https://www.w3.org/TR/html5/text-level-semantics.html#the-code-element\n\t\t\t\tif (match) {\n\t\t\t\t\tvar language = match[3] ? match[3] : 'htm';\n\t\t\t\t\tpre[i].innerHTML = '<span class=\"jush\"><span class=\"jush-' + language + '\">' + jush.highlight_html(language, pre[i].innerHTML.replace(/\\t/g, tab.length ? tab : '\\t')) + '</span></span>'; // span - enable style for class=\"language-\"\n\t\t\t\t}\n\t\t\t\ti++;\n\t\t\t\tif (jush.timeout && window.setTimeout && (new Date() - start) > jush.timeout) {\n\t\t\t\t\twindow.setTimeout(highlight, 100);\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t}\n\t\t};\n\t\thighlight();\n\t},\n\n\tlink_manual: function (language, text) {\n\t\tvar code = document.createElement('code');\n\t\tcode.innerHTML = this.highlight(language, text);\n\t\tvar as = code.getElementsByTagName('a');\n\t\tfor (var i = 0; i < as.length; i++) {\n\t\t\tif (as[i].href) {\n\t\t\t\treturn as[i].href;\n\t\t\t}\n\t\t}\n\t\treturn '';\n\t},\n\n\tcreate_link: function (link, s, attrs) {\n\t\treturn '<a'\n\t\t\t+ (this.create_links && link ? ' href=\"' + link + '\" class=\"jush-help\"' : '')\n\t\t\t+ (typeof this.create_links == 'string' ? ' ' + this.create_links.replace(/^\\s+/, '') : '')\n\t\t\t+ (attrs || '')\n\t\t\t+ '>' + s + '</a>'\n\t\t;\n\t},\n\n\tkeywords_links: function (state, s) {\n\t\tif (/^js(_write|_code)+\$/.test(state)) {\n\t\t\tstate = 'js';\n\t\t}\n\t\tif (/^(php_quo_var|php_php|php_sql|php_sqlite|php_pgsql|php_mssql|php_oracle|php_echo|php_phpini|php_http|php_mail)\$/.test(state)) {\n\t\t\tstate = 'php2';\n\t\t}\n\t\tif (state == 'sql_code') {\n\t\t\tstate = 'sql';\n\t\t}\n\t\tif (this.links2 && this.links2[state]) {\n\t\t\tvar url = this.urls[state];\n\t\t\tvar links2 = this.links2[state];\n\t\t\ts = s.replace(links2, function (str, match1) {\n\t\t\t\tfor (var i=arguments.length - 4; i > 1; i--) {\n\t\t\t\t\tif (arguments[i]) {\n\t\t\t\t\t\tvar link = (/^https?:/.test(url[i-1]) || !url[i-1] ? url[i-1] : url[0].replace(/\\\$key/g, url[i-1]));\n\t\t\t\t\t\tswitch (state) {\n\t\t\t\t\t\t\tcase 'php': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'php_new': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()).replace(/\\\\/g, '-'); break; // toLowerCase() - case sensitive after #\n\t\t\t\t\t\t\tcase 'phpini': link = link.replace(/\\\$1/g, (/^suhosin\\./.test(arguments[i])) ? arguments[i] : arguments[i].toLowerCase().replace(/_/g, '-')); break;\n\t\t\t\t\t\t\tcase 'php_doc': link = link.replace(/\\\$1/g, arguments[i].replace(/^\\W+/, '')); break;\n\t\t\t\t\t\t\tcase 'js_doc': link = link.replace(/\\\$1/g, arguments[i].replace(/^\\W*(.)/, function (match, p1) { return p1.toUpperCase(); })); break;\n\t\t\t\t\t\t\tcase 'http': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'sql': link = link.replace(/\\\$1/g, arguments[i].replace(/\\b(ALTER|CREATE|DROP|RENAME|SHOW)\\s+SCHEMA\\b/, '\$1 DATABASE').toLowerCase().replace(/\\s+|_/g, '-')); break;\n\t\t\t\t\t\t\tcase 'sqlset': link = link.replace(/\\\$1/g, (links2.test(arguments[i].replace(/_/g, '-')) ? arguments[i].replace(/_/g, '-') : arguments[i]).toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'sqlstatus': link = link.replace(/\\\$1/g, (/mariadb/.test(url[0]) ? arguments[i].toLowerCase() : arguments[i])); break;\n\t\t\t\t\t\t\tcase 'sqlite': link = link.replace(/\\\$1/g, arguments[i].toLowerCase().replace(/\\s+/g, '')); break;\n\t\t\t\t\t\t\tcase 'sqliteset': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'sqlitestatus': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'pgsql': link = link.replace(/\\\$1/g, arguments[i].toLowerCase().replace(/\\s+/g, (i == 1 ? '-' : ''))); break;\n\t\t\t\t\t\t\tcase 'pgsqlset': link = link.replace(/\\\$1/g, arguments[i].replace(/_/g, '-').toUpperCase()); break;\n\t\t\t\t\t\t\tcase 'cnf': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'js': link = link.replace(/\\\$1/g, arguments[i].replace(/\\./g, '/')); break;\n\t\t\t\t\t\t\tdefault: link = link.replace(/\\\$1/g, arguments[i]).replace(/\\\\/g, '-');\n\t\t\t\t\t\t}\n\t\t\t\t\t\tvar title = '';\n\t\t\t\t\t\tif (jush.api[state]) {\n\t\t\t\t\t\t\ttitle = jush.api[state][(state == 'js' ? arguments[i] : arguments[i].toLowerCase())];\n\t\t\t\t\t\t}\n\t\t\t\t\t\treturn (match1 ? match1 : '') + jush.create_link(link, arguments[i], (title ? ' title=\"' + jush.htmlspecialchars_quo(title) + '\"' : '')) + (arguments[arguments.length - 3] ? arguments[arguments.length - 3] : '');\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t});\n\t\t}\n\t\tif (this.custom_links[state]) {\n\t\t\tif (Array.isArray(this.custom_links[state])) { // backwards compatibility\n\t\t\t\tvar url = this.custom_links[state][0];\n\t\t\t\tvar re = this.custom_links[state][1];\n\t\t\t\tthis.custom_links[state] = {};\n\t\t\t\tthis.custom_links[state][url] = re;\n\t\t\t}\n\t\t\tfor (var url in this.custom_links[state]) {\n\t\t\t\ts = s.replace(this.custom_links[state][url], function (str) {\n\t\t\t\t\tvar offset = arguments[arguments.length - 2];\n\t\t\t\t\tif (/<[^>]*\$/.test(s.substr(0, offset))) {\n\t\t\t\t\t\treturn str; // don't create links inside tags\n\t\t\t\t\t}\n\t\t\t\t\treturn '<a href=\"' + jush.htmlspecialchars_quo(url.replace('\$&', encodeURIComponent(str))) + '\" class=\"jush-custom\">' + str + '</a>' // not create_link() - ignores create_links\n\t\t\t\t});\n\t\t\t}\n\t\t}\n\t\treturn s;\n\t},\n\n\tbuild_regexp: function (key, tr1) {\n\t\tvar re = [ ];\n\t\tsubpatterns = [ '' ];\n\t\tfor (var k in tr1) {\n\t\t\tvar in_bra = false;\n\t\t\tsubpatterns.push(k);\n\t\t\tvar s = tr1[k].source.replace(/\\\\.|\\((?!\\?)|\\[|]|([a-z])(?:-([a-z]))?/gi, function (str, match1, match2) {\n\t\t\t\t// count capturing subpatterns\n\t\t\t\tif (str == (in_bra ? ']' : '[')) {\n\t\t\t\t\tin_bra = !in_bra;\n\t\t\t\t}\n\t\t\t\tif (str == '(') {\n\t\t\t\t\tsubpatterns.push(k);\n\t\t\t\t}\n\t\t\t\tif (match1 && tr1[k].ignoreCase) {\n\t\t\t\t\tif (in_bra) {\n\t\t\t\t\t\treturn str.toLowerCase() + str.toUpperCase();\n\t\t\t\t\t}\n\t\t\t\t\treturn '[' + match1.toLowerCase() + match1.toUpperCase() + ']' + (match2 ? '-[' + match2.toLowerCase() + match2.toUpperCase() + ']' : '');\n\t\t\t\t}\n\t\t\t\treturn str;\n\t\t\t});\n\t\t\tre.push('(' + s + ')');\n\t\t}\n\t\tthis.subpatterns[key] = subpatterns;\n\t\tthis.regexps[key] = new RegExp(re.join('|'), 'g');\n\t},\n\n\thighlight_states: function (states, text, in_php, escape) {\n\t\tif (!this.regexps) {\n\t\t\tthis.regexps = { };\n\t\t\tfor (var key in this.tr) {\n\t\t\t\tthis.build_regexp(key, this.tr[key]);\n\t\t\t}\n\t\t} else {\n\t\t\tfor (var key in this.tr) {\n\t\t\t\tthis.regexps[key].lastIndex = 0;\n\t\t\t}\n\t\t}\n\t\tvar state = states[states.length - 1];\n\t\tif (!this.tr[state]) {\n\t\t\treturn [ this.htmlspecialchars(text), states ];\n\t\t}\n\t\tvar ret = [ ]; // return\n\t\tfor (var i=1; i < states.length; i++) {\n\t\t\tret.push('<span class=\"jush-' + states[i] + '\">');\n\t\t}\n\t\tvar match;\n\t\tvar child_states = [ ];\n\t\tvar s_states;\n\t\tvar start = 0;\n\t\twhile (start < text.length && (match = this.regexps[state].exec(text))) {\n\t\t\tif (states[0] != 'htm' && /^<\\/(script|style)>\$/i.test(match[0])) {\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\tvar key, m = [ ];\n\t\t\tfor (var i = match.length; i--; ) {\n\t\t\t\tif (match[i] || !match[0].length) { // WScript returns empty string even for non matched subexpressions\n\t\t\t\t\tkey = this.subpatterns[state][i];\n\t\t\t\t\twhile (this.subpatterns[state][i - 1] == key) {\n\t\t\t\t\t\ti--;\n\t\t\t\t\t}\n\t\t\t\t\twhile (this.subpatterns[state][i] == key) {\n\t\t\t\t\t\tm.push(match[i]);\n\t\t\t\t\t\ti++;\n\t\t\t\t\t}\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (!key) {\n\t\t\t\treturn [ 'regexp not found', [ ] ];\n\t\t\t}\n\n\t\t\tif (in_php && key == 'php') {\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\t//~ console.log(states + ' (' + key + '): ' + text.substring(start).replace(/\\n/g, '\\\\n'));\n\t\t\tvar out = (key.charAt(0) == '_');\n\t\t\tvar division = match.index + (key == 'php_halt2' ? match[0].length : 0);\n\t\t\tvar s = text.substring(start, division);\n\n\t\t\t// highlight children\n\t\t\tvar prev_state = states[states.length - 2];\n\t\t\tif (/^(att_quo|att_apo|att_val)\$/.test(state) && (/^(att_js|att_css|att_http)\$/.test(prev_state) || /^\\s*javascript:/i.test(s))) { // javascript: - easy but without own state //! should be checked only in %URI;\n\t\t\t\tchild_states.unshift(prev_state == 'att_css' ? 'css_pro' : (prev_state == 'att_http' ? 'http' : 'js'));\n\t\t\t\ts_states = this.highlight_states(child_states, this.html_entity_decode(s), true, (state == 'att_apo' ? this.htmlspecialchars_apo : (state == 'att_quo' ? this.htmlspecialchars_quo : this.htmlspecialchars_quo_apo)));\n\t\t\t} else if (state == 'css_js' || state == 'cnf_http' || state == 'cnf_phpini' || state == 'sql_sqlset' || state == 'sqlite_sqliteset' || state == 'pgsql_pgsqlset') {\n\t\t\t\tchild_states.unshift(state.replace(/^[^_]+_/, ''));\n\t\t\t\ts_states = this.highlight_states(child_states, s, true);\n\t\t\t} else if ((state == 'php_quo' || state == 'php_apo') && /^(php_php|php_sql|php_sqlite|php_pgsql|php_mssql|php_oracle|php_phpini|php_http|php_mail)\$/.test(prev_state)) {\n\t\t\t\tchild_states.unshift(prev_state.substr(4));\n\t\t\t\ts_states = this.highlight_states(child_states, this.stripslashes(s), true, (state == 'php_apo' ? this.addslashes_apo : this.addslashes_quo));\n\t\t\t} else if (key == 'php_halt2') {\n\t\t\t\tchild_states.unshift('htm');\n\t\t\t\ts_states = this.highlight_states(child_states, s, true);\n\t\t\t} else if ((state == 'apo' || state == 'quo') && prev_state == 'js_write_code') {\n\t\t\t\tchild_states.unshift('htm');\n\t\t\t\ts_states = this.highlight_states(child_states, s, true);\n\t\t\t} else if ((state == 'apo' || state == 'quo') && prev_state == 'js_http_code') {\n\t\t\t\tchild_states.unshift('http');\n\t\t\t\ts_states = this.highlight_states(child_states, s, true);\n\t\t\t} else if (((state == 'php_quo' || state == 'php_apo') && prev_state == 'php_echo') || (state == 'php_eot2' && states[states.length - 3] == 'php_echo')) {\n\t\t\t\tvar i;\n\t\t\t\tfor (i=states.length; i--; ) {\n\t\t\t\t\tprev_state = states[i];\n\t\t\t\t\tif (prev_state.substring(0, 3) != 'php' && prev_state != 'att_quo' && prev_state != 'att_apo' && prev_state != 'att_val') {\n\t\t\t\t\t\tbreak;\n\t\t\t\t\t}\n\t\t\t\t\tprev_state = '';\n\t\t\t\t}\n\t\t\t\tvar f = (state == 'php_eot2' ? this.addslashes : (state == 'php_apo' ? this.addslashes_apo : this.addslashes_quo));\n\t\t\t\ts = this.stripslashes(s);\n\t\t\t\tif (/^(att_js|att_css|att_http)\$/.test(prev_state)) {\n\t\t\t\t\tvar g = (states[i+1] == 'att_quo' ? this.htmlspecialchars_quo : (states[i+1] == 'att_apo' ? this.htmlspecialchars_apo : this.htmlspecialchars_quo_apo));\n\t\t\t\t\tchild_states.unshift(prev_state == 'att_js' ? 'js' : prev_state.substr(4));\n\t\t\t\t\ts_states = this.highlight_states(child_states, this.html_entity_decode(s), true, function (string) { return f(g(string)); });\n\t\t\t\t} else if (prev_state && child_states) {\n\t\t\t\t\tchild_states.unshift(prev_state);\n\t\t\t\t\ts_states = this.highlight_states(child_states, s, true, f);\n\t\t\t\t} else {\n\t\t\t\t\ts = this.htmlspecialchars(s);\n\t\t\t\t\ts_states = [ (escape ? escape(s) : s), (!out || !/^(att_js|att_css|att_http|css_js|js_write_code|js_http_code|php_php|php_sql|php_sqlite|php_pgsql|php_mssql|php_oracle|php_echo|php_phpini|php_http|php_mail)\$/.test(state) ? child_states : [ ]) ];\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\ts = this.htmlspecialchars(s);\n\t\t\t\ts_states = [ (escape ? escape(s) : s), (!out || !/^(att_js|att_css|att_http|css_js|js_write_code|js_http_code|php_php|php_sql|php_sqlite|php_pgsql|php_mssql|php_oracle|php_echo|php_phpini|php_http|php_mail)\$/.test(state) ? child_states : [ ]) ]; // reset child states when leaving construct\n\t\t\t}\n\t\t\ts = s_states[0];\n\t\t\tchild_states = s_states[1];\n\t\t\ts = this.keywords_links(state, s);\n\t\t\tret.push(s);\n\n\t\t\ts = text.substring(division, match.index + match[0].length);\n\t\t\ts = (m.length < 3 ? (s ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(s) : s) + '</span>' : '') : (m[1] ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(m[1]) : m[1]) + '</span>' : '') + this.htmlspecialchars(escape ? escape(m[2]) : m[2]) + (m[3] ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(m[3]) : m[3]) + '</span>' : ''));\n\t\t\tif (!out) {\n\t\t\t\tif (this.links && this.links[key] && m[2]) {\n\t\t\t\t\tif (/^tag/.test(key)) {\n\t\t\t\t\t\tthis.last_tag = m[2].toLowerCase();\n\t\t\t\t\t}\n\t\t\t\t\tvar link = m[2].toLowerCase();\n\t\t\t\t\tvar k_link = '';\n\t\t\t\t\tfor (var k in this.links[key]) {\n\t\t\t\t\t\tvar m2 = this.links[key][k].exec(m[2]);\n\t\t\t\t\t\tif (m2) {\n\t\t\t\t\t\t\tif (m2[1]) {\n\t\t\t\t\t\t\t\tlink = m2[1].toLowerCase().replace(/\\\\/g, '-'); // \\ is PHP namespace;\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\tk_link = k;\n\t\t\t\t\t\t\tif (key != 'att') {\n\t\t\t\t\t\t\t\tbreak;\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t\tif (key == 'php_met') {\n\t\t\t\t\t\tthis.last_class = (k_link && !/^(self|parent|static|dir)\$/i.test(link) ? link : '');\n\t\t\t\t\t}\n\t\t\t\t\tif (k_link) {\n\t\t\t\t\t\ts = (m[1] ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(m[1]) : m[1]) + '</span>' : '');\n\t\t\t\t\t\ts += this.create_link(\n\t\t\t\t\t\t\t(/^https?:/.test(k_link) ? k_link : this.urls[key].replace(/\\\$key/, k_link))\n\t\t\t\t\t\t\t\t.replace(/\\\$val/, (/^https?:/.test(k_link) ? link.toLowerCase() : link))\n\t\t\t\t\t\t\t\t.replace(/\\\$tag/, this.last_tag),\n\t\t\t\t\t\t\tthis.htmlspecialchars(escape ? escape(m[2]) : m[2])); //! use jush.api\n\t\t\t\t\t\ts += (m[3] ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(m[3]) : m[3]) + '</span>' : '');\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tret.push('<span class=\"jush-' + key + '\">', s);\n\t\t\t\tstates.push(key);\n\t\t\t\tif (state == 'php_eot') {\n\t\t\t\t\tthis.tr.php_eot2._2 = new RegExp('(\\n)(' + match[1] + ')(;?\\n)');\n\t\t\t\t\tthis.build_regexp('php_eot2', (match[2] == \"'\" ? { _2: this.tr.php_eot2._2 } : this.tr.php_eot2));\n\t\t\t\t} else if (state == 'pgsql_eot') {\n\t\t\t\t\tthis.tr.pgsql_eot2._2 = new RegExp('\\\\\$' + match[0].replace(/\\\$/, '\\\\\$'));\n\t\t\t\t\tthis.build_regexp('pgsql_eot2', this.tr.pgsql_eot2);\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tif (state == 'php_met' && this.last_class) {\n\t\t\t\t\tvar title = (jush.api['php2'] ? jush.api['php2'][(this.last_class + '::' + s).toLowerCase()] : '');\n\t\t\t\t\ts = this.create_link(this.urls[state].replace(/\\\$key/, this.last_class) + '.' + s.toLowerCase(), s, (title ? ' title=\"' + this.htmlspecialchars_quo(title) + '\"' : ''));\n\t\t\t\t}\n\t\t\t\tret.push(s);\n\t\t\t\tfor (var i = Math.min(states.length, +key.substr(1)); i--; ) {\n\t\t\t\t\tret.push('</span>');\n\t\t\t\t\tstates.pop();\n\t\t\t\t}\n\t\t\t}\n\t\t\tstart = match.index + match[0].length;\n\t\t\tif (!states.length) { // out of states\n\t\t\t\tbreak;\n\t\t\t}\n\t\t\tstate = states[states.length - 1];\n\t\t\tthis.regexps[state].lastIndex = start;\n\t\t}\n\t\tret.push(this.keywords_links(state, this.htmlspecialchars(text.substring(start))));\n\t\tfor (var i=1; i < states.length; i++) {\n\t\t\tret.push('</span>');\n\t\t}\n\t\tstates.shift();\n\t\treturn [ ret.join(''), states ];\n\t},\n\n\t/** Replace <&> by HTML entities\n\t* @param string\n\t* @return string\n\t*/\n\thtmlspecialchars: function (string) {\n\t\treturn string.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\t},\n\n\thtmlspecialchars_quo: function (string) {\n\t\treturn jush.htmlspecialchars(string).replace(/\"/g, '&quot;'); // jush - this.htmlspecialchars_quo is passed as reference\n\t},\n\n\thtmlspecialchars_apo: function (string) {\n\t\treturn jush.htmlspecialchars(string).replace(/'/g, '&#39;');\n\t},\n\n\thtmlspecialchars_quo_apo: function (string) {\n\t\treturn jush.htmlspecialchars_quo(string).replace(/'/g, '&#39;');\n\t},\n\n\t/** Decode HTML entities\n\t* @param string\n\t* @return string\n\t*/\n\thtml_entity_decode: function (string) {\n\t\treturn string.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&nbsp;/g, '\\u00A0').replace(/&#(?:([0-9]+)|x([0-9a-f]+));/gi, function (str, p1, p2) { //! named entities\n\t\t\treturn String.fromCharCode(p1 ? p1 : parseInt(p2, 16));\n\t\t}).replace(/&amp;/g, '&');\n\t},\n\n\t/** Add backslash before backslash\n\t* @param string\n\t* @return string\n\t*/\n\taddslashes: function (string) {\n\t\treturn string.replace(/\\\\/g, '\\\\\$&');\n\t},\n\n\taddslashes_apo: function (string) {\n\t\treturn string.replace(/[\\\\']/g, '\\\\\$&');\n\t},\n\n\taddslashes_quo: function (string) {\n\t\treturn string.replace(/[\\\\\"]/g, '\\\\\$&');\n\t},\n\n\t/** Remove backslash before \\\"'\n\t* @param string\n\t* @return string\n\t*/\n\tstripslashes: function (string) {\n\t\treturn string.replace(/\\\\([\\\\\"'])/g, '\$1');\n\t}\n};\n\n\n\njush.tr = { // transitions - key: go inside this state, _2: go outside 2 levels (number alone is put to the beginning in Chrome)\n\t// regular expressions matching empty string could be used only in the last key\n\tquo: { php: jush.php, esc: /\\\\/, _1: /\"/ },\n\tapo: { php: jush.php, esc: /\\\\/, _1: /'/ },\n\tcom: { php: jush.php, _1: /\\*\\// },\n\tcom_nest: { com_nest: /\\/\\*/, _1: /\\*\\// },\n\tphp: { _1: /\\?>/ }, // overwritten by jush-php.js\n\tesc: { _1: /./ }, //! php_quo allows [0-7]{1,3} and x[0-9A-Fa-f]{1,2}\n\tone: { _1: /(?=\\n)/ },\n\tnum: { _1: /()/ },\n\n\tsql_apo: { esc: /\\\\/, _0: /''/, _1: /'/ },\n\tsql_quo: { esc: /\\\\/, _0: /\"\"/, _1: /\"/ },\n\tsql_var: { _1: /(?=[^_.\$a-zA-Z0-9])/ },\n\tsqlite_apo: { _0: /''/, _1: /'/ },\n\tsqlite_quo: { _0: /\"\"/, _1: /\"/ },\n\tbac: { _1: /`/ },\n\tbra: { _1: /]/ }\n};\n\n// string: \$key stands for key in jush.links, \$val stands for found string\n// array: [0] is base, other elements correspond to () in jush.links2, \$key stands for text of selected element, \$1 stands for found string\njush.urls = { };\njush.links = { };\njush.links2 = { }; // first and last () is used as delimiter\n/** Get callback for autocompletition\n* @param string escaped empty identifier, e.g. `` for MySQL or [] for MS SQL\n* @param Object<string, Array<string>> keys are table names, values are lists of columns\n* @return Function see autocomplete()\n*/\njush.autocompleteSql = function (esc, tablesColumns) {\n\t/**\n\t* key: regular expression; ' ' will be expanded to '\\\\s+', '\\\\w' to esc[0]+'?\\\\w'+esc[1]+'?', '\$' will be appended\n\t* value: list of autocomplete words; '?' means to not use the word if it's already in the current query\n\t*/\n\tconst keywordsDefault = {\n\t\t'^': ['SELECT', 'INSERT INTO', 'UPDATE', 'DELETE FROM', 'EXPLAIN'],\n\t\t'^EXPLAIN ': ['SELECT'],\n\t\t'^INSERT ': ['IGNORE'],\n\t\t'^INSERT .+\\\\) ': ['?VALUES', 'ON DUPLICATE KEY UPDATE'],\n\t\t'^UPDATE \\\\w+ ': ['SET'],\n\t\t'^UPDATE \\\\w+ SET .+ ': ['?WHERE'],\n\t\t'^DELETE FROM \\\\w+ ': ['WHERE'],\n\t\t' JOIN \\\\w+(( AS)? (?!(ON|USING|AS) )\\\\w+)? ': ['ON', 'USING'],\n\t\t'\\\\bSELECT ': ['*', 'DISTINCT'],\n\t\t'\\\\bSELECT .+ ': ['?FROM'],\n\t\t'\\\\bSELECT (?!.* (WHERE|GROUP BY|HAVING|ORDER BY|LIMIT) ).+ FROM .+ ': ['INNER JOIN', 'LEFT JOIN', '?WHERE'],\n\t\t'\\\\bSELECT (?!.* (HAVING|ORDER BY|LIMIT|OFFSET) ).+ FROM .+ ': ['?GROUP BY'],\n\t\t'\\\\bSELECT (?!.* (ORDER BY|LIMIT|OFFSET) ).+ FROM .+ ': ['?HAVING'],\n\t\t'\\\\bSELECT (?!.* (LIMIT|OFFSET) ).+ FROM .+ ': ['?ORDER BY'], // this matches prefixes without LIMIT|OFFSET and offers ORDER BY if it's not already used in prefix or suffix\n\t\t'\\\\bSELECT (?!.* (OFFSET) ).+ FROM .+ ': ['?LIMIT', '?OFFSET'],\n\t\t' ORDER BY (?!.* (LIMIT|OFFSET) ).+ ': ['DESC'],\n\t};\n\t\n\t/** Get list of strings for autocompletion\n\t* @param string\n\t* @param string\n\t* @param string\n\t* @return Object<string, number> keys are words, values are offsets\n\t*/\n\tfunction autocomplete(state, before, after) {\n\t\tif (/^(one|com|sql_apo|sqlite_apo)\$/.test(state)) {\n\t\t\treturn {};\n\t\t}\n\t\tbefore = before\n\t\t\t.replace(/\\/\\*.*?\\*\\/|\\s--[^\\n]*|'[^']+'/s, '') // strip comments and strings\n\t\t\t.replace(/.*;/s, '') // strip previous query\n\t\t\t.trimStart()\n\t\t;\n\t\tafter = after.replace(/;.*/s, ''); // strip next query\n\t\tconst query = before + after;\n\t\tconst allTables = Object.keys(tablesColumns);\n\t\tconst usedTables = findTables(query); // tables used by the current query\n\t\tconst uniqueColumns = {};\n\t\tfor (const table of Object.values(usedTables)) {\n\t\t\tfor (const column of tablesColumns[table]) {\n\t\t\t\tuniqueColumns[column] = 0;\n\t\t\t}\n\t\t}\n\t\tconst columns = Object.keys(uniqueColumns);\n\t\tif (columns.length > 50) {\n\t\t\tcolumns.length = 0;\n\t\t}\n\t\tif (Object.keys(usedTables).length > 1) {\n\t\t\tfor (const alias in usedTables) {\n\t\t\t\tcolumns.push(alias + '.');\n\t\t\t}\n\t\t}\n\t\t\n\t\tconst preferred = {\n\t\t\t'\\\\b(FROM|INTO|^UPDATE|JOIN) ': allTables, // all tables including the current ones (self-join)\n\t\t\t'\\\\b(^INSERT|USING) [^(]*\\\\(([^)]+, )?': columns, // offer columns right after '(' or after ','\n\t\t\t'(^UPDATE .+ SET| DUPLICATE KEY UPDATE| BY) (.+, )?': columns,\n\t\t\t' (WHERE|HAVING|AND|OR|ON|=) ': columns,\n\t\t};\n\t\tkeywordsDefault['\\\\bSELECT( DISTINCT)? (?!.* FROM )(.+, )?'] = columns; // this is not in preferred because we prefer '*'\n\t\t\n\t\tconst context = before.replace(escRe('[\\\\w`]+\$'), ''); // in 'UPDATE tab.`co', context is 'UPDATE tab.'\n\t\tbefore = before.replace(escRe('.*[^\\\\w`]', 's'), ''); // in 'UPDATE tab.`co', before is '`co'\n\t\t\n\t\tconst thisColumns = []; // columns in the current table ('table.')\n\t\tconst match = context.match(escRe('`?(\\\\w+)`?\\\\.\$'));\n\t\tif (match) {\n\t\t\tlet table = match[1];\n\t\t\tif (!tablesColumns[table]) {\n\t\t\t\ttable = usedTables[table];\n\t\t\t}\n\t\t\tif (tablesColumns[table]) {\n\t\t\t\tthisColumns.push(...tablesColumns[table]);\n\t\t\t\tpreferred['\\\\.'] = thisColumns;\n\t\t\t}\n\t\t}\n\n\t\tif (query.includes(esc[0]) && !/^\\w/.test(before)) { // if there's any ` in the query, use ` everywhere unless the user starts typing letters\n\t\t\tallTables.forEach(addEsc);\n\t\t\tcolumns.forEach(addEsc);\n\t\t\tthisColumns.forEach(addEsc);\n\t\t}\n\t\t\n\t\tconst ac = {};\n\t\tfor (const keywords of [preferred, keywordsDefault]) {\n\t\t\tfor (const re in keywords) {\n\t\t\t\tif (context.match(escRe(re.replace(/ /g, '\\\\s+').replace(/\\\\w\\+/g, '`?\\\\w+`?') + '\$', 'is'))) {\n\t\t\t\t\tfor (let keyword of keywords[re]) {\n\t\t\t\t\t\tif (keyword[0] == '?') {\n\t\t\t\t\t\t\tkeyword = keyword.substring(1);\n\t\t\t\t\t\t\tif (query.match(new RegExp('\\\\s+' + keyword + '\\\\s+', 'i'))) {\n\t\t\t\t\t\t\t\tcontinue;\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}\n\t\t\t\t\t\tif (keyword.length > before.length && keyword.toUpperCase().startsWith(before.toUpperCase())) {\n\t\t\t\t\t\t\tconst isCol = (keywords[re] == columns || keywords[re] == thisColumns);\n\t\t\t\t\t\t\tac[keyword + (isCol ? '' : ' ')] = before.length;\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\t\n\t\treturn ac;\n\t}\n\t\n\tfunction addEsc(val, key, array) {\n\t\tarray[key] = esc[0] + val.replace(/\\.?\$/, esc[1] + '\$&');\n\t}\n\n\t/** Change odd ` to esc[0], even to esc[1] */\n\tfunction escRe(re, flags) {\n\t\tlet i = 0;\n\t\treturn new RegExp(re.replace(/`/g, () => (esc[0] == '[' ? '\\\\' : '') + esc[i++ % 2]), flags);\n\t}\n\n\t/** @return Object<string, string> key is alias, value is actual table */\n\tfunction findTables(query) {\n\t\tconst matches = query.matchAll(escRe('\\\\b(FROM|JOIN|INTO|UPDATE)\\\\s+(\\\\w+|`.+?`)((\\\\s+AS)?\\\\s+((?!(LEFT|INNER|JOIN|ON|USING|WHERE|GROUP|HAVING|ORDER|LIMIT)\\\\b)\\\\w+|`.+?`))?', 'gi')); //! handle `abc``def`\n\t\tconst result = {};\n\t\tfor (const match of matches) {\n\t\t\tconst table = match[2].replace(escRe('^`|`\$', 'g'), '');\n\t\t\tconst alias = (match[5] ? match[5].replace(escRe('^`|`\$', 'g'), '') : table);\n\t\t\tif (tablesColumns[table]) {\n\t\t\t\tresult[alias] = table;\n\t\t\t}\n\t\t}\n\t\tif (!Object.keys(result).length) {\n\t\t\tfor (const table in tablesColumns) {\n\t\t\t\tresult[table] = table;\n\t\t\t}\n\t\t}\n\t\treturn result;\n\t}\n\n\t// we open the autocomplete on word character, space, '(', '.' and '`'; textarea also triggers it on Backspace and Ctrl+Space\n\tautocomplete.openBy = escRe('^[\\\\w`(. ]\$'); //! ignore . in 1.23\n\n\treturn autocomplete;\n};\njush.textarea = (function () {\n\t//! IE sometimes inserts empty <p> in start of a string when newline is entered inside\n\t\n\tfunction findSelPos(pre) {\n\t\tvar sel = getSelection();\n\t\tif (sel.rangeCount) {\n\t\t\tvar range = sel.getRangeAt(0);\n\t\t\treturn findPosition(pre, range.startContainer, range.startOffset);\n\t\t}\n\t}\n\n\tfunction findPosition(el, container, offset) {\n\t\tvar pos = { pos: 0 };\n\t\tfindPositionRecurse(el, container, offset, pos);\n\t\treturn pos.pos;\n\t}\n\n\tfunction findPositionRecurse(child, container, offset, pos) {\n\t\tif (child.nodeType == 3) {\n\t\t\tif (child == container) {\n\t\t\t\tpos.pos += offset;\n\t\t\t\treturn true;\n\t\t\t}\n\t\t\tpos.pos += child.textContent.length;\n\t\t} else if (child == container) {\n\t\t\tfor (var i = 0; i < offset; i++) {\n\t\t\t\tfindPositionRecurse(child.childNodes[i], container, offset, pos);\n\t\t\t}\n\t\t\treturn true;\n\t\t} else {\n\t\t\tif (/^(br|div)\$/i.test(child.tagName)) {\n\t\t\t\tpos.pos++;\n\t\t\t}\n\t\t\tfor (var i = 0; i < child.childNodes.length; i++) {\n\t\t\t\tif (findPositionRecurse(child.childNodes[i], container, offset, pos)) {\n\t\t\t\t\treturn true;\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (/^p\$/i.test(child.tagName)) {\n\t\t\t\tpos.pos++;\n\t\t\t}\n\t\t}\n\t}\n\t\n\tfunction findOffset(el, pos) {\n\t\treturn findOffsetRecurse(el, { pos: pos });\n\t}\n\t\n\tfunction findOffsetRecurse(child, pos) {\n\t\tif (child.nodeType == 3) { // 3 - TEXT_NODE\n\t\t\tif (child.textContent.length >= pos.pos) {\n\t\t\t\treturn { container: child, offset: pos.pos };\n\t\t\t}\n\t\t\tpos.pos -= child.textContent.length;\n\t\t} else {\n\t\t\tfor (var i = 0; i < child.childNodes.length; i++) {\n\t\t\t\tif (/^br\$/i.test(child.childNodes[i].tagName)) {\n\t\t\t\t\tif (!pos.pos) {\n\t\t\t\t\t\treturn { container: child, offset: i };\n\t\t\t\t\t}\n\t\t\t\t\tpos.pos--;\n\t\t\t\t\tif (!pos.pos && i == child.childNodes.length - 1) { // last invisible <br>\n\t\t\t\t\t\treturn { container: child, offset: i };\n\t\t\t\t\t}\n\t\t\t\t} else {\n\t\t\t\t\tvar result = findOffsetRecurse(child.childNodes[i], pos);\n\t\t\t\t\tif (result) {\n\t\t\t\t\t\treturn result;\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\t\n\tfunction setSelPos(pre, pos) {\n\t\tif (pos) {\n\t\t\tvar start = findOffset(pre, pos);\n\t\t\tif (start) {\n\t\t\t\tvar range = document.createRange();\n\t\t\t\trange.setStart(start.container, start.offset);\n\t\t\t\tvar sel = getSelection();\n\t\t\t\tsel.removeAllRanges();\n\t\t\t\tsel.addRange(range);\n\t\t\t}\n\t\t}\n\t}\n\n\tfunction setText(pre, text, end) {\n\t\tvar lang = 'txt';\n\t\tif (text.length < 1e4) { // highlighting is slow with most languages\n\t\t\tvar match = /(^|\\s)(?:jush|language)-(\\S+)/.exec(pre.jushTextarea.className);\n\t\t\tlang = (match ? match[2] : 'htm');\n\t\t}\n\t\tvar html = jush.highlight(lang, text).replace(/\\n/g, '<br>');\n\t\tsetHTML(pre, html, text, end);\n\t\tif (openAc) {\n\t\t\topenAutocomplete(pre);\n\t\t\topenAc = false;\n\t\t} else {\n\t\t\tcloseAutocomplete();\n\t\t}\n\t}\n\t\n\tfunction setHTML(pre, html, text, pos) {\n\t\tpre.innerHTML = html;\n\t\tpre.lastHTML = pre.innerHTML; // not html because IE reformats the string\n\t\tpre.jushTextarea.value = text;\n\t\tsetSelPos(pre, pos);\n\t}\n\t\n\tfunction keydown(event) {\n\t\tconst ctrl = (event.ctrlKey || event.metaKey);\n\t\tif (!event.altKey) {\n\t\t\tif (!ctrl && acEl.options.length) {\n\t\t\t\tconst select =\n\t\t\t\t\t(event.key == 'ArrowDown' ? Math.min(acEl.options.length - 1, acEl.selectedIndex + 1) :\n\t\t\t\t\t(event.key == 'ArrowUp' ? Math.max(0, acEl.selectedIndex - 1) :\n\t\t\t\t\t(event.key == 'PageDown' ? Math.min(acEl.options.length - 1, acEl.selectedIndex + acEl.size) :\n\t\t\t\t\t(event.key == 'PageUp' ? Math.max(0, acEl.selectedIndex - acEl.size) :\n\t\t\t\t\tnull))))\n\t\t\t\t;\n\t\t\t\tif (select !== null) {\n\t\t\t\t\tacEl.selectedIndex = select;\n\t\t\t\t\treturn false;\n\t\t\t\t}\n\t\t\t\tif (/^(Enter|Tab)\$/.test(event.key) && !event.shiftKey) {\n\t\t\t\t\tinsertAutocomplete(this);\n\t\t\t\t\treturn false;\n\t\t\t\t}\n\t\t\t}\n\t\t\t\n\t\t\tif (ctrl) {\n\t\t\t\tif (event.key == ' ') {\n\t\t\t\t\topenAutocomplete(this);\n\t\t\t\t}\n\t\t\t} else if (autocomplete.openBy && (autocomplete.openBy.test(event.key) || event.key == 'Backspace' || (event.key == 'Enter' && event.shiftKey))) {\n\t\t\t\topenAc = true;\n\t\t\t} else if (/^(Escape|ArrowLeft|ArrowRight|Home|End)\$/.test(event.key)) {\n\t\t\t\tcloseAutocomplete();\n\t\t\t}\n\t\t}\n\t\t\n\t\tif (ctrl && !event.altKey) {\n\t\t\tvar isUndo = (event.keyCode == 90); // 90 - z\n\t\t\tvar isRedo = (event.keyCode == 89 || (event.keyCode == 90 && event.shiftKey)); // 89 - y\n\t\t\tif (isUndo || isRedo) {\n\t\t\t\tif (isRedo) {\n\t\t\t\t\tif (this.jushUndoPos + 1 < this.jushUndo.length) {\n\t\t\t\t\t\tthis.jushUndoPos++;\n\t\t\t\t\t\tvar undo = this.jushUndo[this.jushUndoPos];\n\t\t\t\t\t\tsetText(this, undo.text, undo.end)\n\t\t\t\t\t}\n\t\t\t\t} else if (this.jushUndoPos >= 0) {\n\t\t\t\t\tthis.jushUndoPos--;\n\t\t\t\t\tvar undo = this.jushUndo[this.jushUndoPos] || { html: '', text: '' };\n\t\t\t\t\tsetText(this, undo.text, this.jushUndo[this.jushUndoPos + 1].start);\n\t\t\t\t}\n\t\t\t\treturn false;\n\t\t\t}\n\t\t} else {\n\t\t\tsetLastPos(this);\n\t\t}\n\t}\n\t\n\tconst maxSize = 8;\n\tconst acEl = document.createElement('select');\n\tacEl.size = maxSize;\n\tacEl.className = 'jush-autocomplete';\n\tacEl.style.position = 'absolute';\n\tacEl.style.zIndex = 1;\n\tacEl.onclick = () => {\n\t\tinsertAutocomplete(pre);\n\t};\n\topenAc = false;\n\tcloseAutocomplete();\n\n\tfunction findState(node) {\n\t\tlet match;\n\t\twhile (node && (!/^(CODE|PRE)\$/.test(node.tagName) || !(match = node.className.match(/(^|\\s)jush-(\\w+)/)))) {\n\t\t\tnode = node.parentElement;\n\t\t}\n\t\treturn (match ? match[2] : '');\n\t}\n\n\tfunction openAutocomplete(pre) {\n\t\tconst prevSelected = acEl.options[acEl.selectedIndex];\n\t\tcloseAutocomplete();\n\t\tconst sel = getSelection();\n\t\tif (sel.rangeCount) {\n\t\t\tconst range = sel.getRangeAt(0);\n\t\t\tconst pos = findSelPos(pre);\n\t\t\tconst state = findState(range.startContainer);\n\t\t\tif (state) {\n\t\t\t\tconst ac = autocomplete(\n\t\t\t\t\tstate,\n\t\t\t\t\tpre.innerText.substring(0, pos),\n\t\t\t\t\tpre.innerText.substring(pos)\n\t\t\t\t);\n\t\t\t\tif (Object.keys(ac).length) {\n\t\t\t\t\tlet select = 0;\n\t\t\t\t\tfor (const word in ac) {\n\t\t\t\t\t\tconst option = document.createElement('option');\n\t\t\t\t\t\toption.value = ac[word];\n\t\t\t\t\t\toption.textContent = word;\n\t\t\t\t\t\tacEl.append(option);\n\t\t\t\t\t\tif (prevSelected && prevSelected.textContent == word) {\n\t\t\t\t\t\t\tselect = acEl.options.length - 1;\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t\tacEl.selectedIndex = select;\n\t\t\t\t\tacEl.size = Math.min(Math.max(acEl.options.length, 2), maxSize);\n\t\t\t\t\tpositionAutocomplete();\n\t\t\t\t\tacEl.style.display = '';\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\t\n\tfunction positionAutocomplete() {\n\t\tconst sel = getSelection();\n\t\tif (sel.rangeCount && acEl.options.length) {\n\t\t\tconst pos = findSelPos(pre);\n\t\t\tconst range = sel.getRangeAt(0);\n\t\t\tconst range2 = range.cloneRange();\n\t\t\trange2.setStart(range.startContainer, Math.max(0, range.startOffset - acEl.options[0].value)); // autocompletions currently couldn't cross container boundary\n\t\t\tconst span = document.createElement('span'); // collapsed ranges have empty bounding rect\n\t\t\trange2.insertNode(span);\n\t\t\tacEl.style.left = span.offsetLeft + 'px';\n\t\t\tacEl.style.top = (span.offsetTop + 20) + 'px';\n\t\t\tspan.remove();\n\t\t\tsetSelPos(pre, pos); // required on iOS\n\t\t}\n\t}\n\t\n\tfunction closeAutocomplete() {\n\t\tacEl.options.length = 0;\n\t\tacEl.style.display = 'none';\n\t}\n\t\n\tfunction insertAutocomplete(pre) {\n\t\tconst sel = getSelection();\n\t\tconst range = sel.rangeCount && sel.getRangeAt(0);\n\t\tif (range) {\n\t\t\tconst insert = acEl.options[acEl.selectedIndex].textContent;\n\t\t\tconst offset = +acEl.options[acEl.selectedIndex].value;\n\t\t\tforceNewUndo = true;\n\t\t\tpre.lastPos = findSelPos(pre);\n\t\t\tconst start = findOffset(pre, pre.lastPos - offset);\n\t\t\trange.setStart(start.container, start.offset);\n\t\t\tdocument.execCommand('insertText', false, insert);\n\t\t\topenAutocomplete(pre);\n\t\t}\n\t}\n\t\n\tfunction setLastPos(pre) {\n\t\tif (pre.lastPos === undefined) {\n\t\t\tpre.lastPos = findSelPos(pre);\n\t\t}\n\t}\n\t\n\tvar forceNewUndo = true;\n\t\n\tfunction highlight(pre) {\n\t\tvar start = pre.lastPos;\n\t\tpre.lastPos = undefined;\n\t\tvar innerHTML = pre.innerHTML;\n\t\tif (innerHTML != pre.lastHTML) {\n\t\t\tvar end = findSelPos(pre);\n\t\t\tinnerHTML = innerHTML.replace(/<br>((<\\/[^>]+>)*<\\/?div>)(?!\$)/gi, function (all, rest) {\n\t\t\t\tif (end) {\n\t\t\t\t\tend--;\n\t\t\t\t}\n\t\t\t\treturn rest;\n\t\t\t});\n\t\t\tpre.innerHTML = innerHTML\n\t\t\t\t.replace(/<(br|div)\\b[^>]*>/gi, '\\n') // Firefox, Chrome\n\t\t\t\t.replace(/&nbsp;(<\\/[pP]\\b)/g, '\$1') // IE\n\t\t\t\t.replace(/<\\/p\\b[^>]*>(\$|<p\\b[^>]*>)/gi, '\\n') // IE\n\t\t\t\t.replace(/(&nbsp;)+\$/gm, '') // Chrome for some users\n\t\t\t;\n\t\t\tsetText(pre, pre.textContent.replace(/\\u00A0/g, ' '), end);\n\t\t\tpre.jushUndo.length = pre.jushUndoPos + 1;\n\t\t\tif (forceNewUndo || !pre.jushUndo.length || pre.jushUndo[pre.jushUndoPos].end !== start) {\n\t\t\t\tpre.jushUndo.push({ text: pre.jushTextarea.value, start: start, end: (forceNewUndo ? undefined : end) });\n\t\t\t\tpre.jushUndoPos++;\n\t\t\t\tforceNewUndo = false;\n\t\t\t} else {\n\t\t\t\tpre.jushUndo[pre.jushUndoPos].text = pre.jushTextarea.value;\n\t\t\t\tpre.jushUndo[pre.jushUndoPos].end = end;\n\t\t\t}\n\t\t}\n\t}\n\t\n\tfunction input() {\n\t\thighlight(this);\n\t}\n\t\n\tfunction paste(event) {\n\t\tif (event.clipboardData) {\n\t\t\tsetLastPos(this);\n\t\t\tif (document.execCommand('insertHTML', false, jush.htmlspecialchars(event.clipboardData.getData('text')))) { // Opera doesn't support insertText\n\t\t\t\tevent.preventDefault();\n\t\t\t}\n\t\t\tforceNewUndo = true; // highlighted in input\n\t\t}\n\t}\n\t\n\tfunction click(event) {\n\t\tif ((event.ctrlKey || event.metaKey) && event.target.href) {\n\t\t\topen(event.target.href);\n\t\t}\n\t\tcloseAutocomplete();\n\t}\n\t\n\tlet pre;\n\tlet autocomplete = () => ({});\n\taddEventListener('resize', positionAutocomplete);\n\t\n\treturn function textarea(el, autocompleter) {\n\t\tif (!window.getSelection) {\n\t\t\treturn;\n\t\t}\n\t\tif (autocompleter) {\n\t\t\tautocomplete = autocompleter;\n\t\t}\n\t\tpre = document.createElement('pre');\n\t\tpre.contentEditable = true;\n\t\tpre.className = el.className + ' jush';\n\t\tpre.style.border = '1px inset #ccc';\n\t\tpre.style.width = el.clientWidth + 'px';\n\t\tpre.style.height = el.clientHeight + 'px';\n\t\tpre.style.padding = '3px';\n\t\tpre.style.overflow = 'auto';\n\t\tpre.style.resize = 'both';\n\t\tif (el.wrap != 'off') {\n\t\t\tpre.style.whiteSpace = 'pre-wrap';\n\t\t}\n\t\tpre.jushTextarea = el;\n\t\tpre.jushUndo = [ ];\n\t\tpre.jushUndoPos = -1;\n\t\tpre.onkeydown = keydown;\n\t\tpre.oninput = input;\n\t\tpre.onpaste = paste;\n\t\tpre.onclick = click;\n\t\tpre.appendChild(document.createTextNode(el.value));\n\t\thighlight(pre);\n\t\tif (el.spellcheck === false) {\n\t\t\tpre.spellcheck = false;\n\t\t}\n\t\tel.before(pre);\n\t\tel.before(acEl);\n\t\tif (document.activeElement === el) {\n\t\t\tpre.focus();\n\t\t\tif (!el.value) {\n\t\t\t\topenAutocomplete(pre);\n\t\t\t}\n\t\t}\n\t\tacEl.style.font = getComputedStyle(pre).font;\n\t\tel.style.display = 'none';\n\t\treturn pre;\n\t};\n})();\njush.tr.txt = { php: jush.php };\njush.tr.js = { php: jush.php, js_reg: /\\s*\\/(?![\\/*])/, js_obj: /\\s*\\{/, _1: /}/, js_code: /()/ };\njush.tr.js_code = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, js_doc: /\\/\\*\\*/, com: /\\/\\*/, num: jush.num, js_write: /(\\b)(write(?:ln)?)(\\()/, js_http: /(\\.)(setRequestHeader|getResponseHeader)(\\()/, js: /\\{/, _3: /(<)(\\/script)(>)/i, _2: /}/, _1: /[^.\\])}\$\\w\\s]/ };\njush.tr.js_write = { php: jush.php, js_reg: /\\s*\\/(?![\\/*])/, js_write_code: /()/ };\njush.tr.js_http = { php: jush.php, js_reg: /\\s*\\/(?![\\/*])/, js_http_code: /()/ };\njush.tr.js_write_code = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, js_write: /\\(/, _2: /\\)/, _1: /[^\\])}\$\\w\\s]/ };\njush.tr.js_http_code = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, js_http: /\\(/, _2: /\\)/, _1: /[^\\])}\$\\w\\s]/ };\njush.tr.js_one = { php: jush.php, _1: /\\n/, _3: /(<)(\\/script)(>)/i };\njush.tr.js_reg = { php: jush.php, esc: /\\\\/, js_reg_bra: /\\[/, _1: /\\/[a-z]*/i }; //! highlight regexp\njush.tr.js_reg_bra = { php: jush.php, esc: /\\\\/, _1: /]/ };\njush.tr.js_doc = { _1: /\\*\\// };\njush.tr.js_arr = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, js_arr: /\\[/, js_obj: /\\{/, _1: /]/ };\njush.tr.js_obj = { php: jush.php, js_one: /\\s*\\/\\//, com: /\\s*\\/\\*/, js_val: /:/, _1: /\\s*}/, js_key: /()/ };\njush.tr.js_val = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, js_arr: /\\[/, js_obj: /\\{/, _1: /,|(?=})/ };\njush.tr.js_key = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, _1: /(?=[:}])/ };\njush.tr.js_bac = { php: jush.php, esc: /\\\\/, js: /\\\$\\{/, _1: /`/ };\n\njush.urls.js_write = 'https://developer.mozilla.org/en/docs/DOM/\$key.\$val';\njush.urls.js_http = 'https://www.w3.org/TR/XMLHttpRequest/#the-\$val-\$key';\njush.urls.js = ['https://developer.mozilla.org/en/\$key',\n\t'JavaScript/Reference/Global_Objects/\$1',\n\t'JavaScript/Reference/Statements/\$1',\n\t'JavaScript/Reference/Statements/do...while',\n\t'JavaScript/Reference/Statements/if...else',\n\t'JavaScript/Reference/Statements/try...catch',\n\t'JavaScript/Reference/Operators/Special/\$1',\n\t'DOM/document.\$1', 'DOM/element.\$1', 'DOM/event.\$1', 'DOM/form.\$1', 'DOM/table.\$1', 'DOM/window.\$1',\n\t'https://www.w3.org/TR/XMLHttpRequest/',\n\t'JavaScript/Reference/Global_Objects/Array.\$1',\n\t'JavaScript/Reference/Global_Objects/Array\$1',\n\t'JavaScript/Reference/Global_Objects/Date\$1',\n\t'JavaScript/Reference/Global_Objects/Function\$1',\n\t'JavaScript/Reference/Global_Objects/Number\$1',\n\t'JavaScript/Reference/Global_Objects/RegExp\$1',\n\t'JavaScript/Reference/Global_Objects/String\$1'\n];\njush.urls.js_doc = ['https://code.google.com/p/jsdoc-toolkit/wiki/Tag\$key',\n\t'\$1', 'Param', 'Augments', '\$1'\n];\n\njush.links.js_write = { 'document': /^(write|writeln)\$/ };\njush.links.js_http = { 'method': /^(setRequestHeader|getResponseHeader)\$/ };\n\njush.links2.js = /(\\b)(String\\.fromCharCode|Date\\.(?:parse|UTC)|Math\\.(?:E|LN2|LN10|LOG2E|LOG10E|PI|SQRT1_2|SQRT2|abs|acos|asin|atan|atan2|ceil|cos|exp|floor|log|max|min|pow|random|round|sin|sqrt|tan)|Array|Boolean|Date|Error|Function|JavaArray|JavaClass|JavaObject|JavaPackage|Math|Number|Object|Packages|RegExp|String|Infinity|JSON|NaN|undefined|Error|EvalError|RangeError|ReferenceError|SyntaxError|TypeError|URIError|decodeURI|decodeURIComponent|encodeURI|encodeURIComponent|eval|isFinite|isNaN|parseFloat|parseInt|(break|continue|for|function|return|switch|throw|var|while|with)|(do)|(if|else)|(try|catch|finally)|(delete|in|instanceof|new|this|typeof|void)|(alinkColor|anchors|applets|bgColor|body|characterSet|compatMode|contentType|cookie|defaultView|designMode|doctype|documentElement|domain|embeds|fgColor|forms|height|images|implementation|lastModified|linkColor|links|plugins|popupNode|referrer|styleSheets|title|tooltipNode|URL|vlinkColor|width|clear|createAttribute|createDocumentFragment|createElement|createElementNS|createEvent|createNSResolver|createRange|createTextNode|createTreeWalker|evaluate|execCommand|getElementById|getElementsByName|importNode|loadOverlay|queryCommandEnabled|queryCommandIndeterm|queryCommandState|queryCommandValue|write|writeln)|(attributes|childNodes|className|clientHeight|clientLeft|clientTop|clientWidth|dir|firstChild|id|innerHTML|lang|lastChild|localName|name|namespaceURI|nextSibling|nodeName|nodeType|nodeValue|offsetHeight|offsetLeft|offsetParent|offsetTop|offsetWidth|ownerDocument|parentNode|prefix|previousSibling|scrollHeight|scrollLeft|scrollTop|scrollWidth|style|tabIndex|tagName|textContent|addEventListener|appendChild|blur|click|cloneNode|dispatchEvent|focus|getAttribute|getAttributeNS|getAttributeNode|getAttributeNodeNS|getElementsByTagName|getElementsByTagNameNS|hasAttribute|hasAttributeNS|hasAttributes|hasChildNodes|insertBefore|item|normalize|removeAttribute|removeAttributeNS|removeAttributeNode|removeChild|removeEventListener|replaceChild|scrollIntoView|setAttribute|setAttributeNS|setAttributeNode|setAttributeNodeNS|supports|onblur|onchange|onclick|ondblclick|onfocus|onkeydown|onkeypress|onkeyup|onmousedown|onmousemove|onmouseout|onmouseover|onmouseup|onresize)|(altKey|bubbles|button|cancelBubble|cancelable|clientX|clientY|ctrlKey|currentTarget|detail|eventPhase|explicitOriginalTarget|isChar|layerX|layerY|metaKey|originalTarget|pageX|pageY|relatedTarget|screenX|screenY|shiftKey|target|timeStamp|type|view|which|initEvent|initKeyEvent|initMouseEvent|initUIEvent|stopPropagation|preventDefault)|(elements|name|acceptCharset|action|enctype|encoding|method|submit|reset)|(caption|tHead|tFoot|rows|tBodies|align|bgColor|border|cellPadding|cellSpacing|frame|rules|summary|width|createTHead|deleteTHead|createTFoot|deleteTFoot|createCaption|deleteCaption|insertRow|deleteRow)|(content|closed|controllers|crypto|defaultStatus|directories|document|frameElement|frames|history|innerHeight|innerWidth|location|locationbar|menubar|name|navigator|opener|outerHeight|outerWidth|pageXOffset|pageYOffset|parent|personalbar|pkcs11|screen|availTop|availLeft|availHeight|availWidth|colorDepth|height|left|pixelDepth|top|width|scrollbars|scrollMaxX|scrollMaxY|scrollX|scrollY|self|sidebar|status|statusbar|toolbar|window|alert|atob|back|btoa|captureEvents|clearInterval|clearTimeout|close|confirm|dump|escape|find|forward|getAttention|getComputedStyle|getSelection|home|moveBy|moveTo|open|openDialog|print|prompt|releaseEvents|resizeBy|resizeTo|scroll|scrollBy|scrollByLines|scrollByPages|scrollTo|setInterval|setTimeout|sizeToContent|stop|unescape|updateCommands|onabort|onclose|ondragdrop|onerror|onload|onpaint|onreset|onscroll|onselect|onsubmit|onunload)|(XMLHttpRequest)|(length))\\b|(\\.(?:pop|push|reverse|shift|sort|splice|unshift|concat|join|slice)|(\\.(?:getDate|getDay|getFullYear|getHours|getMilliseconds|getMinutes|getMonth|getSeconds|getTime|getTimezoneOffset|getUTCDate|getUTCDay|getUTCFullYear|getUTCHours|getUTCMilliseconds|getUTCMinutes|getUTCMonth|getUTCSeconds|setDate|setFullYear|setHours|setMilliseconds|setMinutes|setMonth|setSeconds|setTime|setUTCDate|setUTCFullYear|setUTCHours|setUTCMilliseconds|setUTCMinutes|setUTCMonth|setUTCSeconds|toDateString|toLocaleDateString|toLocaleTimeString|toTimeString|toUTCString))|(\\.(?:apply|call))|(\\.(?:toExponential|toFixed|toPrecision))|(\\.(?:exec|test))|(\\.(?:charAt|charCodeAt|concat|indexOf|lastIndexOf|localeCompare|match|replace|search|slice|split|substr|substring|toLocaleLowerCase|toLocaleUpperCase|toLowerCase|toUpperCase)))(\\s*\\(|\$)/g; // collisions: bgColor, height, width, length, name\njush.links2.js_doc = /(^[ \\t]*|\\n\\s*\\*\\s*|(?={))(@(?:augments|author|borrows|class|constant|constructor|constructs|default|deprecated|description|event|example|field|fileOverview|function|ignore|inner|lends|memberOf|name|namespace|param|private|property|public|requires|returns|see|since|static|throws|type|version)|(@argument)|(@extends)|(\\{@link))(\\b)/g;\njush.tr.sql = { one: /-- |#|--(?=\\n|\$)/, com_code: /\\/\\*![0-9]*|\\*\\//, com: /\\/\\*/, sql_sqlset: /(\\s*)(SET)(\\s+|\$)(?!NAMES\\b|CHARACTER\\b|PASSWORD\\b|(?:GLOBAL\\s+|SESSION\\s+)?TRANSACTION\\b|@[^@]|NEW\\.|OLD\\.)/i, sql_code: /()/ };\njush.tr.sql_code = { sql_apo: /'/, sql_quo: /\"/, bac: /`/, one: /-- |#|--(?=\\n|\$)/, com_code: /\\/\\*![0-9]*|\\*\\//, com: /\\/\\*/, sql_var: /\\B@/, num: jush.num, _1: /;|\\b(THEN|ELSE|LOOP|REPEAT|DO)\\b/i };\njush.tr.sql_sqlset = { one: /-- |#|--(?=\\n|\$)/, com: /\\/\\*/, sqlset_val: /=/, _1: /;|\$/ };\njush.tr.sqlset_val = { sql_apo: /'/, sql_quo: /\"/, bac: /`/, one: /-- |#|--(?=\\n|\$)/, com: /\\/\\*/, _1: /,/, _2: /;|\$/, num: jush.num }; //! comma can be inside function call\njush.tr.sqlset = { _0: /\$/ }; //! jump from SHOW VARIABLES LIKE ''\njush.tr.sqlstatus = { _0: /\$/ }; //! jump from SHOW STATUS LIKE ''\njush.tr.com_code = { _1: /()/ };\n\njush.urls.sql_sqlset = 'https://dev.mysql.com/doc/mysql/en/\$key';\njush.urls.sql = ['https://dev.mysql.com/doc/mysql/en/\$key',\n\t'alter-event.html', 'alter-table.html', 'alter-view.html', 'analyze-table.html', 'create-event.html', 'create-function.html', 'create-procedure.html', 'create-index.html', 'create-table.html', 'create-trigger.html', 'create-view.html', 'drop-index.html', 'drop-table.html', 'begin-end.html', 'optimize-table.html', 'repair-table.html', 'set-transaction.html', 'show-columns.html', 'show-engines.html', 'show-index.html', 'show-processlist.html', 'show-status.html', 'show-tables.html', 'show-variables.html',\n\t'\$1.html', '\$1-statement.html', 'if-statement.html', 'repeat-statement.html', 'truncate-table.html', 'commit.html', 'savepoints.html', 'lock-tables.html', 'charset-connection.html', 'insert-on-duplicate.html', 'fulltext-search.html', 'example-auto-increment.html',\n\t'comparison-operators.html#operator_\$1', 'comparison-operators.html#function_\$1', 'any-in-some-subqueries.html', 'all-subqueries.html', 'exists-and-not-exists-subqueries.html', 'group-by-modifiers.html', 'string-functions.html#operator_\$1', 'string-comparison-functions.html#operator_\$1', 'regexp.html#operator_\$1', 'regexp.html#operator_regexp', 'logical-operators.html#operator_\$1', 'control-flow-functions.html#operator_\$1', 'arithmetic-functions.html#operator_\$1', 'cast-functions.html#operator_\$1', 'date-and-time-functions.html#function_\$1', 'date-and-time-functions.html#function_date-add',\n\t'', // keywords without link\n\t'numeric-type-syntax.html', 'date-and-time-type-syntax.html', 'string-type-syntax.html', 'mysql-spatial-datatypes.html',\n\t'mathematical-functions.html#function_\$1', 'information-functions.html#function_\$1',\n\t'\$1-storage-engine.html', 'merge-storage-engine.html',\n\t'partitioning-range.html', 'partitioning-list.html', 'partitioning-columns.html', 'partitioning-hash.html', 'partitioning-linear-hash.html', 'partitioning-key.html',\n\t'comparison-operators.html#function_\$1', 'control-flow-functions.html#function_\$1', 'string-functions.html#function_\$1', 'string-comparison-functions.html#function_\$1', 'mathematical-functions.html#function_\$1', 'date-and-time-functions.html#function_\$1', 'cast-functions.html#function_\$1', 'xml-functions.html#function_\$1', 'bit-functions.html#function_\$1', 'encryption-functions.html#function_\$1', 'information-functions.html#function_\$1', 'miscellaneous-functions.html#function_\$1', 'group-by-functions.html#function_\$1',\n\t'functions-to-convert-geometries-between-formats.html#function_asbinary',\n\t'functions-to-convert-geometries-between-formats.html#function_astext',\n\t'functions-for-testing-spatial-relations-between-geometric-objects.html#function_\$1',\n\t'functions-that-create-new-geometries-from-existing-ones.html#function_\$1',\n\t'geometry-property-functions.html#function_\$1',\n\t'gis-wkt-functions.html#function_st-\$1',\n\t'row-subqueries.html',\n\t'fulltext-search.html#function_match'\n];\njush.urls.sqlset = ['https://dev.mysql.com/doc/mysql/en/\$key',\n\t'innodb-parameters.html#sysvar_\$1',\n\t'mysql-cluster-program-options-mysqld.html#option_mysqld_\$1', 'mysql-cluster-replication-conflict-resolution.html#option_mysqld_\$1', 'mysql-cluster-replication-schema.html', 'mysql-cluster-replication-starting.html', 'mysql-cluster-system-variables.html#sysvar_\$1',\n\t'replication-options-binary-log.html#option_mysqld_\$1', 'replication-options-binary-log.html#sysvar_\$1', 'replication-options-master.html#sysvar_\$1', 'replication-options-slave.html#option_mysqld_log-slave-updates', 'replication-options-slave.html#option_mysqld_\$1', 'replication-options-slave.html#sysvar_\$1', 'replication-options.html#option_mysqld_\$1',\n\t'server-options.html#option_mysqld_big-tables', 'server-options.html#option_mysqld_\$1',\n\t'server-system-variables.html#sysvar_\$1', // previously server-session-variables\n\t'server-system-variables.html#sysvar_low_priority_updates', 'server-system-variables.html#sysvar_max_join_size', 'server-system-variables.html#sysvar_\$1',\n\t'ssl-options.html#option_general_\$1'\n];\njush.urls.sqlstatus = ['https://dev.mysql.com/doc/mysql/en/\$key',\n\t'server-status-variables.html#statvar_Com_xxx',\n\t'server-status-variables.html#statvar_\$1'\n];\n\njush.links.sql_sqlset = { 'set-statement.html': /.+/ };\n\njush.links2.sql = /(\\b)(ALTER(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+EVENT|(ALTER(?:\\s+ONLINE|\\s+OFFLINE)?(?:\\s+IGNORE)?\\s+TABLE)|(ALTER(?:\\s+ALGORITHM\\s*=\\s*(?:UNDEFINED|MERGE|TEMPTABLE))?(?:\\s+DEFINER\\s*=\\s*\\S+)?(?:\\s+SQL\\s+SECURITY\\s+(?:DEFINER|INVOKER))?\\s+VIEW)|(ANALYZE(?:\\s+NO_WRITE_TO_BINLOG|\\s+LOCAL)?\\s+TABLE)|(CREATE(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+EVENT)|(CREATE(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+FUNCTION)|(CREATE(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+PROCEDURE)|(CREATE(?:\\s+ONLINE|\\s+OFFLINE)?(?:\\s+UNIQUE|\\s+FULLTEXT|\\s+SPATIAL)?\\s+INDEX)|(CREATE(?:\\s+TEMPORARY)?\\s+TABLE)|(CREATE(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+TRIGGER)|(CREATE(?:\\s+OR\\s+REPLACE)?(?:\\s+ALGORITHM\\s*=\\s*(?:UNDEFINED|MERGE|TEMPTABLE))?(?:\\s+DEFINER\\s*=\\s*\\S+)?(?:\\s+SQL\\s+SECURITY\\s+(?:DEFINER|INVOKER))?\\s+VIEW)|(DROP(?:\\s+ONLINE|\\s+OFFLINE)?\\s+INDEX)|(DROP(?:\\s+TEMPORARY)?\\s+TABLE)|(END)|(OPTIMIZE(?:\\s+NO_WRITE_TO_BINLOG|\\s+LOCAL)?\\s+TABLE)|(REPAIR(?:\\s+NO_WRITE_TO_BINLOG|\\s+LOCAL)?\\s+TABLE)|(SET(?:\\s+GLOBAL|\\s+SESSION)?\\s+TRANSACTION\\s+ISOLATION\\s+LEVEL)|(SHOW(?:\\s+FULL)?\\s+COLUMNS)|(SHOW(?:\\s+STORAGE)?\\s+ENGINES)|(SHOW\\s+(?:INDEX|INDEXES|KEYS))|(SHOW(?:\\s+FULL)?\\s+PROCESSLIST)|(SHOW(?:\\s+GLOBAL|\\s+SESSION)?\\s+STATUS)|(SHOW(?:\\s+FULL)?\\s+TABLES)|(SHOW(?:\\s+GLOBAL|\\s+SESSION)?\\s+VARIABLES)|(ALTER\\s+(?:DATABASE|SCHEMA)|ALTER\\s+LOGFILE\\s+GROUP|ALTER\\s+SERVER|ALTER\\s+TABLESPACE|BACKUP\\s+TABLE|CACHE\\s+INDEX|CALL|CHANGE\\s+MASTER\\s+TO|CHECK\\s+TABLE|CHECKSUM\\s+TABLE|CREATE\\s+(?:DATABASE|SCHEMA)|CREATE\\s+LOGFILE\\s+GROUP|CREATE\\s+SERVER|CREATE\\s+TABLESPACE|CREATE\\s+USER|DELETE|DESCRIBE|DO|DROP\\s+(?:DATABASE|SCHEMA)|DROP\\s+EVENT|DROP\\s+FUNCTION|DROP\\s+PROCEDURE|DROP\\s+LOGFILE\\s+GROUP|DROP\\s+SERVER|DROP\\s+TABLESPACE|DROP\\s+TRIGGER|DROP\\s+USER|DROP\\s+VIEW|EXPLAIN|FLUSH|GRANT|HANDLER|HELP|INSERT|INSTALL\\s+PLUGIN|JOIN|KILL|LOAD\\s+DATA\\s+FROM\\s+MASTER|LOAD\\s+DATA|LOAD\\s+INDEX|LOAD\\s+XML|PURGE\\s+MASTER\\s+LOGS|RENAME\\s+(?:DATABASE|SCHEMA)|RENAME\\s+TABLE|RENAME\\s+USER|REPLACE|RESET\\s+MASTER|RESET\\s+SLAVE|RESIGNAL|RESTORE\\s+TABLE|REVOKE|SELECT|SET\\s+PASSWORD|SHOW\\s+AUTHORS|SHOW\\s+BINARY\\s+LOGS|SHOW\\s+BINLOG\\s+EVENTS|SHOW\\s+CHARACTER\\s+SET|SHOW\\s+COLLATION|SHOW\\s+CONTRIBUTORS|SHOW\\s+CREATE\\s+(?:DATABASE|SCHEMA)|SHOW\\s+CREATE\\s+TABLE|SHOW\\s+CREATE\\s+VIEW|SHOW\\s+(?:DATABASE|SCHEMA)S|SHOW\\s+ENGINE|SHOW\\s+ERRORS|SHOW\\s+GRANTS|SHOW\\s+MASTER\\s+STATUS|SHOW\\s+OPEN\\s+TABLES|SHOW\\s+PLUGINS|SHOW\\s+PRIVILEGES|SHOW\\s+SCHEDULER\\s+STATUS|SHOW\\s+SLAVE\\s+HOSTS|SHOW\\s+SLAVE\\s+STATUS|SHOW\\s+TABLE\\s+STATUS|SHOW\\s+TRIGGERS|SHOW\\s+WARNINGS|SHOW|SIGNAL|START\\s+SLAVE|STOP\\s+SLAVE|UNINSTALL\\s+PLUGIN|UNION|UPDATE|USE)|(LOOP|LEAVE|ITERATE|WHILE)|(IF|ELSEIF)|(REPEAT|UNTIL)|(TRUNCATE(?:\\s+TABLE)?)|(START\\s+TRANSACTION|BEGIN|COMMIT|ROLLBACK)|(SAVEPOINT|ROLLBACK\\s+TO\\s+SAVEPOINT)|((?:UN)?LOCK\\s+TABLES?)|(SET\\s+NAMES|SET\\s+CHARACTER\\s+SET)|(ON\\s+DUPLICATE\\s+KEY\\s+UPDATE)|(IN\\s+BOOLEAN\\s+MODE|IN\\s+NATURAL\\s+LANGUAGE\\s+MODE|WITH\\s+QUERY\\s+EXPANSION)|(AUTO_INCREMENT)|(IS|IS\\s+NULL)|(BETWEEN|NOT\\s+BETWEEN|IN|NOT\\s+IN)|(ANY|SOME)|(ALL)|(EXISTS|NOT\\s+EXISTS)|(WITH\\s+ROLLUP)|(SOUNDS\\s+LIKE)|(LIKE|NOT\\s+LIKE)|(NOT\\s+REGEXP|REGEXP)|(RLIKE)|(NOT|AND|OR|XOR)|(CASE)|(DIV)|(BINARY)|(CURRENT_DATE|CURRENT_TIME|CURRENT_TIMESTAMP|LOCALTIME|LOCALTIMESTAMP|UTC_DATE|UTC_TIME|UTC_TIMESTAMP)|(INTERVAL)|(ACCESSIBLE|ADD|ALTER|ANALYZE|AS|ASC|ASENSITIVE|BEFORE|BOTH|BY|CASCADE|CHANGE|CHARACTER|CHECK|CLOSE|COLLATE|COLUMN|CONDITION|CONSTRAINT|CONTINUE|CONVERT|CREATE|CROSS|CURSOR|DATABASE|DATABASES|DAY_HOUR|DAY_MICROSECOND|DAY_MINUTE|DAY_SECOND|DECLARE|DEFAULT|DELAYED|DESC|DETERMINISTIC|DISTINCT|DISTINCTROW|DROP|DUAL|EACH|ELSE|ENCLOSED|ESCAPED|EXIT|FALSE|FETCH|FLOAT4|FLOAT8|FOR|FORCE|FOREIGN|FROM|FULLTEXT|GROUP|HAVING|HIGH_PRIORITY|HOUR_MICROSECOND|HOUR_MINUTE|HOUR_SECOND|IGNORE|INDEX|INFILE|INNER|INOUT|INSENSITIVE|INT1|INT2|INT3|INT4|INT8|INTO|KEY|KEYS|LEADING|LEFT|LIMIT|LINEAR|LINES|LOAD|LOCK|LONG|LOW_PRIORITY|MASTER_SSL_VERIFY_SERVER_CERT|MATCH|MIDDLEINT|MINUTE_MICROSECOND|MINUTE_SECOND|MODIFIES|NATURAL|NO_WRITE_TO_BINLOG|NULL|OFFSET|ON|OPEN|OPTIMIZE|OPTION|OPTIONALLY|ORDER|OUT|OUTER|OUTFILE|PRECISION|PRIMARY|PROCEDURE|PURGE|RANGE|READ|READS|READ_WRITE|REFERENCES|RELEASE|RENAME|REQUIRE|RESTRICT|RETURN|RIGHT|SCHEMA|SCHEMAS|SECOND_MICROSECOND|SENSITIVE|SEPARATOR|SPATIAL|SPECIFIC|SQL|SQLEXCEPTION|SQLSTATE|SQLWARNING|SQL_BIG_RESULT|SQL_CALC_FOUND_ROWS|SQL_SMALL_RESULT|SSL|STARTING|STRAIGHT_JOIN|TABLE|TERMINATED|THEN|TO|TRAILING|TRIGGER|TRUE|UNDO|UNIQUE|UNLOCK|UNSIGNED|USAGE|USING|VALUES|VARCHARACTER|VARYING|WHEN|WHERE|WITH|WRITE|XOR|YEAR_MONTH|ZEROFILL))\\b(?!\\()|\\b(bit|tinyint|bool|boolean|smallint|mediumint|int|integer|bigint|float|double\\s+precision|double|real|decimal|dec|numeric|fixed|(date|datetime|timestamp|time|year)|(char|varchar|binary|varbinary|tinyblob|tinytext|blob|text|mediumblob|mediumtext|longblob|longtext|enum|set)|(geometry|point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection)|(mod)|(CURRENT_USER)|(InnoDB|MyISAM|MEMORY|CSV|ARCHIVE|BLACKHOLE|MERGE|FEDERATED)|(MRG_MyISAM)|(PARTITION\\s+BY\\s+RANGE)|(PARTITION\\s+BY\\s+LIST)|(PARTITION\\s+BY\\s+COLUMNS)|(PARTITION\\s+BY\\s+HASH)|(PARTITION\\s+BY\\s+LINEAR\\s+HASH)|(PARTITION\\s+BY(?:\\s+LINEAR)?\\s+KEY))\\b|\\b(coalesce|greatest|isnull|interval|least|(if|ifnull|nullif)|(ascii|bin|bit_length|char|char_length|character_length|concat|concat_ws|conv|elt|export_set|field|find_in_set|format|hex|insert|instr|lcase|left|length|load_file|locate|lower|lpad|ltrim|make_set|mid|oct|octet_length|ord|position|quote|repeat|replace|reverse|right|rpad|rtrim|soundex|sounds_like|space|substr|substring|substring_index|trim|ucase|unhex|upper)|(strcmp)|(abs|acos|asin|atan|atan2|ceil|ceiling|cos|cot|crc32|degrees|exp|floor|ln|log|log2|log10|pi|pow|power|radians|rand|round|sign|sin|sqrt|tan|truncate)|(adddate|addtime|convert_tz|curdate|curtime|date|datediff|date_add|date_format|date_sub|day|dayname|dayofmonth|dayofweek|dayofyear|extract|from_days|from_unixtime|get_format|hour|last_day|makedate|maketime|microsecond|minute|month|monthname|now|period_add|period_diff|quarter|second|sec_to_time|str_to_date|subdate|subtime|sysdate|time|timediff|timestamp|timestampadd|timestampdiff|time_format|time_to_sec|to_days|to_seconds|unix_timestamp|week|weekday|weekofyear|year|yearweek)|(cast|convert)|(extractvalue|updatexml)|(bit_count)|(aes_encrypt|aes_decrypt|compress|decode|encode|des_decrypt|des_encrypt|encrypt|md5|old_password|password|sha|sha1|uncompress|uncompressed_length)|(benchmark|charset|coercibility|collation|connection_id|database|found_rows|last_insert_id|row_count|schema|session_user|system_user|user|version)|(default|get_lock|inet_aton|inet_ntoa|is_free_lock|is_used_lock|master_pos_wait|name_const|release_lock|sleep|uuid|uuid_short|values)|(avg|bit_and|bit_or|bit_xor|count|count_distinct|group_concat|min|max|std|stddev|stddev_pop|stddev_samp|sum|var_pop|var_samp|variance)|(asbinary|aswkb)|(astext|aswkt)|(mbrcontains|mbrdisjoint|mbrequal|mbrintersects|mbroverlaps|mbrtouches|mbrwithin|contains|crosses|disjoint|equals|intersects|overlaps|touches|within)|(buffer|convexhull|difference|intersection|symdifference)|(dimension|envelope|geometrytype|srid|boundary|isempty|issimple|x|y|endpoint|glength|numpoints|pointn|startpoint|isring|isclosed|area|exteriorring|interiorringn|numinteriorrings|centroid|geometryn|numgeometries)|(geomcollfromtext|geomfromtext|linefromtext|mlinefromtext|mpointfromtext|mpolyfromtext|pointfromtext|polyfromtext|bdmpolyfromtext|bdpolyfromtext|geomcollfromwkb|geomfromwkb|linefromwkb|mlinefromwkb|mpointfromwkb|mpolyfromwkb|pointfromwkb|polyfromwkb|bdmpolyfromwkb|bdpolyfromwkb|geometrycollection|linestring|multilinestring|multipoint|multipolygon|point|polygon)|(row)|(match|against))(\\s*\\(|\$)/gi; // collisions: char, set, union(), allow parenthesis - IN, ANY, ALL, SOME, NOT, AND, OR, XOR\njush.links2.sqlset = /(\\b)(ignore_builtin_innodb|innodb_adaptive_hash_index|innodb_additional_mem_pool_size|innodb_autoextend_increment|innodb_autoinc_lock_mode|innodb_buffer_pool_awe_mem_mb|innodb_buffer_pool_size|innodb_commit_concurrency|innodb_concurrency_tickets|innodb_data_file_path|innodb_data_home_dir|innodb_doublewrite|innodb_fast_shutdown|innodb_file_io_threads|innodb_file_per_table|innodb_flush_log_at_trx_commit|innodb_flush_method|innodb_force_recovery|innodb_checksums|innodb_lock_wait_timeout|innodb_locks_unsafe_for_binlog|innodb_log_arch_dir|innodb_log_archive|innodb_log_buffer_size|innodb_log_file_size|innodb_log_files_in_group|innodb_log_group_home_dir|innodb_max_dirty_pages_pct|innodb_max_purge_lag|innodb_mirrored_log_groups|innodb_open_files|innodb_rollback_on_timeout|innodb_stats_on_metadata|innodb_support_xa|innodb_sync_spin_loops|innodb_table_locks|innodb_thread_concurrency|innodb_thread_sleep_delay|innodb_use_legacy_cardinality_algorithm|(ndb[-_]batch[-_]size)|(ndb[-_]log[-_]update[-_]as[-_]write|ndb_log_updated_only)|(ndb_log_orig)|(slave[-_]allow[-_]batching)|(have_ndbcluster|multi_range_count|ndb_autoincrement_prefetch_sz|ndb_cache_check_time|ndb_extra_logging|ndb_force_send|ndb_use_copying_alter_table|ndb_use_exact_count|ndb_wait_connected)|(log[-_]bin[-_]trust[-_]function[-_]creators|log[-_]bin)|(binlog_cache_size|max_binlog_cache_size|max_binlog_size|sync_binlog)|(auto_increment_increment|auto_increment_offset)|(ndb_log_empty_epochs)|(log[-_]slave[-_]updates|report[-_]host|report[-_]password|report[-_]port|report[-_]user|slave[-_]net[-_]timeout|slave[-_]skip[-_]errors)|(init_slave|rpl_recovery_rank|slave_compressed_protocol|slave_exec_mode|slave_transaction_retries|sql_slave_skip_counter)|(master[-_]bind|slave[-_]load[-_]tmpdir|server[-_]id)|(sql_big_tables)|(basedir|big[-_]tables|binlog[-_]format|collation[-_]server|datadir|debug|delay[-_]key[-_]write|engine[-_]condition[-_]pushdown|event[-_]scheduler|general[-_]log|character[-_]set[-_]filesystem|character[-_]set[-_]server|character[-_]sets[-_]dir|init[-_]file|language|large[-_]pages|log[-_]error|log[-_]output|log[-_]queries[-_]not[-_]using[-_]indexes|log[-_]slow[-_]queries|log[-_]warnings|log|low[-_]priority[-_]updates|memlock|min[-_]examined[-_]row[-_]limit|old[-_]passwords|open[-_]files[-_]limit|pid[-_]file|port|safe[-_]show[-_]database|secure[-_]auth|secure[-_]file[-_]priv|skip[-_]external[-_]locking|skip[-_]networking|skip[-_]show[-_]database|slow[-_]query[-_]log|socket|sql[-_]mode|tmpdir|version)|(autocommit|error_count|foreign_key_checks|identity|insert_id|last_insert_id|profiling|profiling_history_size|rand_seed1|rand_seed2|sql_auto_is_null|sql_big_selects|sql_buffer_result|sql_log_bin|sql_log_off|sql_log_update|sql_notes|sql_quote_show_create|sql_safe_updates|sql_warnings|timestamp|unique_checks|warning_count)|(sql_low_priority_updates)|(sql_max_join_size)|(automatic_sp_privileges|back_log|bulk_insert_buffer_size|collation_connection|collation_database|completion_type|concurrent_insert|connect_timeout|date_format|datetime_format|default_week_format|delayed_insert_limit|delayed_insert_timeout|delayed_queue_size|div_precision_increment|expire_logs_days|flush|flush_time|ft_boolean_syntax|ft_max_word_len|ft_min_word_len|ft_query_expansion_limit|ft_stopword_file|general_log_file|group_concat_max_len|have_archive|have_blackhole_engine|have_compress|have_crypt|have_csv|have_dynamic_loading|have_example_engine|have_federated_engine|have_geometry|have_innodb|have_isam|have_merge_engine|have_openssl|have_partitioning|have_query_cache|have_raid|have_row_based_replication|have_rtree_keys|have_ssl|have_symlink|hostname|character_set_client|character_set_connection|character_set_database|character_set_results|character_set_system|init_connect|interactive_timeout|join_buffer_size|keep_files_on_create|key_buffer_size|key_cache_age_threshold|key_cache_block_size|key_cache_division_limit|large_page_size|lc_time_names|license|local_infile|locked_in_memory|log_bin|long_query_time|lower_case_file_system|lower_case_table_names|max_allowed_packet|max_connect_errors|max_connections|max_delayed_threads|max_error_count|max_heap_table_size|max_insert_delayed_threads|max_join_size|max_length_for_sort_data|max_prepared_stmt_count|max_relay_log_size|max_seeks_for_key|max_sort_length|max_sp_recursion_depth|max_tmp_tables|max_user_connections|max_write_lock_count|myisam_data_pointer_size|myisam_max_sort_file_size|myisam_recover_options|myisam_repair_threads|myisam_sort_buffer_size|myisam_stats_method|myisam_use_mmap|named_pipe|net_buffer_length|net_read_timeout|net_retry_count|net_write_timeout|new|old|optimizer_prune_level|optimizer_search_depth|optimizer_switch|plugin_dir|preload_buffer_size|prepared_stmt_count|protocol_version|pseudo_thread_id|query_alloc_block_size|query_cache_limit|query_cache_min_res_unit|query_cache_size|query_cache_type|query_cache_wlock_invalidate|query_prealloc_size|range_alloc_block_size|read_buffer_size|read_only|read_rnd_buffer_size|relay_log_purge|relay_log_space_limit|shared_memory|shared_memory_base_name|slow_launch_time|slow_query_log_file|sort_buffer_size|sql_select_limit|storage_engine|sync_frm|system_time_zone|table_cache|table_definition_cache|table_lock_wait_timeout|table_open_cache|table_type|thread_cache_size|thread_concurrency|thread_handling|thread_stack|time_format|time_zone|timed_mutexes|tmp_table_size|transaction_alloc_block_size|transaction_prealloc_size|tx_isolation|updatable_views_with_limit|version_comment|version_compile_machine|version_compile_os|wait_timeout)|(ssl[-_]ca|ssl[-_]capath|ssl[-_]cert|ssl[-_]cipher|ssl[-_]key))((?!-)\\b)/gi;\njush.links2.sqlstatus = /()(Com_.+|(.+))()/gi;\n";
+	echo "/** JUSH - JavaScript Syntax Highlighter\n* @link https://jush.sourceforge.io/\n* @author Jakub Vrana, https://www.vrana.cz\n* @copyright 2007 Jakub Vrana\n* @license https://www.apache.org/licenses/LICENSE-2.0 Apache License, Version 2.0\n*/\n\n/* Limitations:\n<style> and <script> supposes CDATA or HTML comments\nunnecessary escaping (e.g. echo \"\\'\" or ='&quot;') is removed\n*/\n\nvar jush = {\n\tcreate_links: true, // string for extra <a> parameters, e.g. 'target=\"_blank\"'\n\ttimeout: 1000, // milliseconds\n\tcustom_links: { }, // { state: { url: regexp } }, for example { php : { 'doc/\$&.html': /\\b(getData|setData)\\b/g } }\n\tapi: { }, // { state: { function: description } }, for example { php: { array: 'Create an array' } }\n\n\tphp: /<\\?(?!xml)(?:php)?|<script\\s+language\\s*=\\s*(?:\"php\"|'php'|php)\\s*>/i, // asp_tags=0, short_open_tag=1\n\tnum: /(?:0x[0-9a-f]+)|(?:\\b[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:e[+-]?[0-9]+)?/i,\n\n\tregexps: undefined,\n\tsubpatterns: { },\n\n\t/** Link stylesheet\n\t* @param string\n\t* @param [string]\n\t*/\n\tstyle: function (href, media) {\n\t\tvar link = document.createElement('link');\n\t\tlink.rel = 'stylesheet';\n\t\tif (media) {\n\t\t\tlink.media = media;\n\t\t}\n\t\tlink.href = href;\n\t\tdocument.getElementsByTagName('head')[0].appendChild(link);\n\t},\n\n\t/** Highlight text\n\t* @param string\n\t* @param string\n\t* @return string\n\t*/\n\thighlight: function (language, text) {\n\t\tthis.last_tag = '';\n\t\tthis.last_class = '';\n\t\treturn '<span class=\"jush\">' + this.highlight_states([ language ], text.replace(/\\r\\n?/g, '\\n'), !/^(htm|tag|xml|txt)\$/.test(language))[0] + '</span>';\n\t},\n\n\t/** Highlight html\n\t* @param string\n\t* @param string\n\t* @return string\n\t*/\n\thighlight_html: function (language, html) {\n\t\tvar original = html.replace(/<br(\\s+[^>]*)?>/gi, '\\n');\n\t\tvar highlighted = jush.highlight(language, jush.html_entity_decode(original.replace(/<[^>]*>/g, '')));\n\n\t\tvar inject = { };\n\t\tvar pos = 0;\n\t\tvar last_offset = 0;\n\t\toriginal.replace(/(&[^;]+;)|(?:<[^>]+>)+/g, function (str, entity, offset) {\n\t\t\tpos += (offset - last_offset) + (entity ? 1 : 0);\n\t\t\tif (!entity) {\n\t\t\t\tinject[pos] = str;\n\t\t\t}\n\t\t\tlast_offset = offset + str.length;\n\t\t});\n\n\t\tpos = 0;\n\t\thighlighted = highlighted.replace(/([^&<]*)(?:(&[^;]+;)|(?:<[^>]+>)+|\$)/g, function (str, text, entity) {\n\t\t\tfor (var i = text.length; i >= 0; i--) {\n\t\t\t\tif (inject[pos + i]) {\n\t\t\t\t\tstr = str.substr(0, i) + inject[pos + i] + str.substr(i);\n\t\t\t\t\tdelete inject[pos + i];\n\t\t\t\t}\n\t\t\t}\n\t\t\tpos += text.length + (entity ? 1 : 0);\n\t\t\treturn str;\n\t\t});\n\t\treturn highlighted;\n\t},\n\n\t/** Highlight text in tags\n\t* @param mixed tag name or array of HTMLElement\n\t* @param number number of spaces for tab, 0 for tab itself, defaults to 4\n\t*/\n\thighlight_tag: function (tag, tab_width) {\n\t\tvar pre = (typeof tag == 'string' ? document.getElementsByTagName(tag) : tag);\n\t\tvar tab = '';\n\t\tfor (var i = (tab_width !== undefined ? tab_width : 4); i--; ) {\n\t\t\ttab += ' ';\n\t\t}\n\t\tvar i = 0;\n\t\tvar highlight = function () {\n\t\t\tvar start = new Date();\n\t\t\twhile (i < pre.length) {\n\t\t\t\tvar match = /(^|\\s)(?:jush|language(?=-\\S))(\$|\\s|-(\\S+))/.exec(pre[i].className); // https://www.w3.org/TR/html5/text-level-semantics.html#the-code-element\n\t\t\t\tif (match) {\n\t\t\t\t\tvar language = match[3] ? match[3] : 'htm';\n\t\t\t\t\tpre[i].innerHTML = '<span class=\"jush\"><span class=\"jush-' + language + '\">' + jush.highlight_html(language, pre[i].innerHTML.replace(/\\t/g, tab.length ? tab : '\\t')) + '</span></span>'; // span - enable style for class=\"language-\"\n\t\t\t\t}\n\t\t\t\ti++;\n\t\t\t\tif (jush.timeout && window.setTimeout && (new Date() - start) > jush.timeout) {\n\t\t\t\t\twindow.setTimeout(highlight, 100);\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t}\n\t\t};\n\t\thighlight();\n\t},\n\n\tlink_manual: function (language, text) {\n\t\tvar code = document.createElement('code');\n\t\tcode.innerHTML = this.highlight(language, text);\n\t\tvar as = code.getElementsByTagName('a');\n\t\tfor (var i = 0; i < as.length; i++) {\n\t\t\tif (as[i].href) {\n\t\t\t\treturn as[i].href;\n\t\t\t}\n\t\t}\n\t\treturn '';\n\t},\n\n\tcreate_link: function (link, s, attrs) {\n\t\treturn '<a'\n\t\t\t+ (this.create_links && link ? ' href=\"' + link + '\" class=\"jush-help\"' : '')\n\t\t\t+ (typeof this.create_links == 'string' ? ' ' + this.create_links.replace(/^\\s+/, '') : '')\n\t\t\t+ (attrs || '')\n\t\t\t+ '>' + s + '</a>'\n\t\t;\n\t},\n\n\tkeywords_links: function (state, s) {\n\t\tif (/^js(_write|_code)+\$/.test(state)) {\n\t\t\tstate = 'js';\n\t\t}\n\t\tif (/^(php_quo_var|php_php|php_sql|php_sqlite|php_pgsql|php_mssql|php_oracle|php_echo|php_phpini|php_http|php_mail)\$/.test(state)) {\n\t\t\tstate = 'php2';\n\t\t}\n\t\tif (state == 'sql_code') {\n\t\t\tstate = 'sql';\n\t\t}\n\t\tif (this.links2 && this.links2[state]) {\n\t\t\tvar url = this.urls[state];\n\t\t\tvar links2 = this.links2[state];\n\t\t\ts = s.replace(links2, function (str, match1) {\n\t\t\t\tfor (var i=arguments.length - 4; i > 1; i--) {\n\t\t\t\t\tif (arguments[i]) {\n\t\t\t\t\t\tvar link = (/^https?:/.test(url[i-1]) || !url[i-1] ? url[i-1] : url[0].replace(/\\\$key/g, url[i-1]));\n\t\t\t\t\t\tswitch (state) {\n\t\t\t\t\t\t\tcase 'php': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'php_new': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()).replace(/\\\\/g, '-'); break; // toLowerCase() - case sensitive after #\n\t\t\t\t\t\t\tcase 'phpini': link = link.replace(/\\\$1/g, (/^suhosin\\./.test(arguments[i])) ? arguments[i] : arguments[i].toLowerCase().replace(/_/g, '-')); break;\n\t\t\t\t\t\t\tcase 'php_doc': link = link.replace(/\\\$1/g, arguments[i].replace(/^\\W+/, '')); break;\n\t\t\t\t\t\t\tcase 'js_doc': link = link.replace(/\\\$1/g, arguments[i].replace(/^\\W*(.)/, function (match, p1) { return p1.toUpperCase(); })); break;\n\t\t\t\t\t\t\tcase 'http': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'sql': link = link.replace(/\\\$1/g, arguments[i].replace(/\\b(ALTER|CREATE|DROP|RENAME|SHOW)\\s+SCHEMA\\b/, '\$1 DATABASE').toLowerCase().replace(/\\s+|_/g, '-')); break;\n\t\t\t\t\t\t\tcase 'sqlset': link = link.replace(/\\\$1/g, (links2.test(arguments[i].replace(/_/g, '-')) ? arguments[i].replace(/_/g, '-') : arguments[i]).toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'sqlstatus': link = link.replace(/\\\$1/g, (/mariadb/.test(url[0]) ? arguments[i].toLowerCase() : arguments[i])); break;\n\t\t\t\t\t\t\tcase 'sqlite': link = link.replace(/\\\$1/g, arguments[i].toLowerCase().replace(/\\s+/g, '')); break;\n\t\t\t\t\t\t\tcase 'sqliteset': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'sqlitestatus': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'pgsql': link = link.replace(/\\\$1/g, arguments[i].toLowerCase().replace(/\\s+/g, (i == 1 ? '-' : ''))); break;\n\t\t\t\t\t\t\tcase 'pgsqlset': link = link.replace(/\\\$1/g, arguments[i].replace(/_/g, '-').toUpperCase()); break;\n\t\t\t\t\t\t\tcase 'cnf': link = link.replace(/\\\$1/g, arguments[i].toLowerCase()); break;\n\t\t\t\t\t\t\tcase 'js': link = link.replace(/\\\$1/g, arguments[i].replace(/\\./g, '/')); break;\n\t\t\t\t\t\t\tdefault: link = link.replace(/\\\$1/g, arguments[i]).replace(/\\\\/g, '-');\n\t\t\t\t\t\t}\n\t\t\t\t\t\tvar title = '';\n\t\t\t\t\t\tif (jush.api[state]) {\n\t\t\t\t\t\t\ttitle = jush.api[state][(state == 'js' ? arguments[i] : arguments[i].toLowerCase())];\n\t\t\t\t\t\t}\n\t\t\t\t\t\treturn (match1 ? match1 : '') + jush.create_link(link, arguments[i], (title ? ' title=\"' + jush.htmlspecialchars_quo(title) + '\"' : '')) + (arguments[arguments.length - 3] ? arguments[arguments.length - 3] : '');\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t});\n\t\t}\n\t\tif (this.custom_links[state]) {\n\t\t\tif (Array.isArray(this.custom_links[state])) { // backwards compatibility\n\t\t\t\tvar url = this.custom_links[state][0];\n\t\t\t\tvar re = this.custom_links[state][1];\n\t\t\t\tthis.custom_links[state] = {};\n\t\t\t\tthis.custom_links[state][url] = re;\n\t\t\t}\n\t\t\tfor (var url in this.custom_links[state]) {\n\t\t\t\ts = s.replace(this.custom_links[state][url], function (str) {\n\t\t\t\t\tvar offset = arguments[arguments.length - 2];\n\t\t\t\t\tif (/<[^>]*\$/.test(s.substr(0, offset)) || /^[^<]*<\\/a>/.test(s.substr(offset))) {\n\t\t\t\t\t\treturn str; // don't create links inside tags\n\t\t\t\t\t}\n\t\t\t\t\treturn '<a href=\"' + jush.htmlspecialchars_quo(url.replace('\$&', encodeURIComponent(str))) + '\" class=\"jush-custom\">' + str + '</a>' // not create_link() - ignores create_links\n\t\t\t\t});\n\t\t\t}\n\t\t}\n\t\treturn s;\n\t},\n\n\tbuild_regexp: function (key, tr1) {\n\t\tvar re = [ ];\n\t\tsubpatterns = [ '' ];\n\t\tfor (var k in tr1) {\n\t\t\tvar in_bra = false;\n\t\t\tsubpatterns.push(k);\n\t\t\tvar s = tr1[k].source.replace(/\\\\.|\\((?!\\?)|\\[|]|([a-z])(?:-([a-z]))?/gi, function (str, match1, match2) {\n\t\t\t\t// count capturing subpatterns\n\t\t\t\tif (str == (in_bra ? ']' : '[')) {\n\t\t\t\t\tin_bra = !in_bra;\n\t\t\t\t}\n\t\t\t\tif (str == '(') {\n\t\t\t\t\tsubpatterns.push(k);\n\t\t\t\t}\n\t\t\t\tif (match1 && tr1[k].ignoreCase) {\n\t\t\t\t\tif (in_bra) {\n\t\t\t\t\t\treturn str.toLowerCase() + str.toUpperCase();\n\t\t\t\t\t}\n\t\t\t\t\treturn '[' + match1.toLowerCase() + match1.toUpperCase() + ']' + (match2 ? '-[' + match2.toLowerCase() + match2.toUpperCase() + ']' : '');\n\t\t\t\t}\n\t\t\t\treturn str;\n\t\t\t});\n\t\t\tre.push('(' + s + ')');\n\t\t}\n\t\tthis.subpatterns[key] = subpatterns;\n\t\tthis.regexps[key] = new RegExp(re.join('|'), 'g');\n\t},\n\n\thighlight_states: function (states, text, in_php, escape) {\n\t\tif (!this.regexps) {\n\t\t\tthis.regexps = { };\n\t\t\tfor (var key in this.tr) {\n\t\t\t\tthis.build_regexp(key, this.tr[key]);\n\t\t\t}\n\t\t} else {\n\t\t\tfor (var key in this.tr) {\n\t\t\t\tthis.regexps[key].lastIndex = 0;\n\t\t\t}\n\t\t}\n\t\tvar state = states[states.length - 1];\n\t\tif (!this.tr[state]) {\n\t\t\treturn [ this.htmlspecialchars(text), states ];\n\t\t}\n\t\tvar ret = [ ]; // return\n\t\tfor (var i=1; i < states.length; i++) {\n\t\t\tret.push('<span class=\"jush-' + states[i] + '\">');\n\t\t}\n\t\tvar match;\n\t\tvar child_states = [ ];\n\t\tvar s_states;\n\t\tvar start = 0;\n\t\twhile (start < text.length && (match = this.regexps[state].exec(text))) {\n\t\t\tif (states[0] != 'htm' && /^<\\/(script|style)>\$/i.test(match[0])) {\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\tvar key, m = [ ];\n\t\t\tfor (var i = match.length; i--; ) {\n\t\t\t\tif (match[i] || !match[0].length) { // WScript returns empty string even for non matched subexpressions\n\t\t\t\t\tkey = this.subpatterns[state][i];\n\t\t\t\t\twhile (this.subpatterns[state][i - 1] == key) {\n\t\t\t\t\t\ti--;\n\t\t\t\t\t}\n\t\t\t\t\twhile (this.subpatterns[state][i] == key) {\n\t\t\t\t\t\tm.push(match[i]);\n\t\t\t\t\t\ti++;\n\t\t\t\t\t}\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (!key) {\n\t\t\t\treturn [ 'regexp not found', [ ] ];\n\t\t\t}\n\n\t\t\tif (in_php && key == 'php') {\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\t//~ console.log(states + ' (' + key + '): ' + text.substring(start).replace(/\\n/g, '\\\\n'));\n\t\t\tvar out = (key.charAt(0) == '_');\n\t\t\tvar division = match.index + (key == 'php_halt2' ? match[0].length : 0);\n\t\t\tvar s = text.substring(start, division);\n\n\t\t\t// highlight children\n\t\t\tvar prev_state = states[states.length - 2];\n\t\t\tif (/^(att_quo|att_apo|att_val)\$/.test(state) && (/^(att_js|att_css|att_http)\$/.test(prev_state) || /^\\s*javascript:/i.test(s))) { // javascript: - easy but without own state //! should be checked only in %URI;\n\t\t\t\tchild_states.unshift(prev_state == 'att_css' ? 'css_pro' : (prev_state == 'att_http' ? 'http' : 'js'));\n\t\t\t\ts_states = this.highlight_states(child_states, this.html_entity_decode(s), true, (state == 'att_apo' ? this.htmlspecialchars_apo : (state == 'att_quo' ? this.htmlspecialchars_quo : this.htmlspecialchars_quo_apo)));\n\t\t\t} else if (state == 'css_js' || state == 'cnf_http' || state == 'cnf_phpini' || state == 'sql_sqlset' || state == 'sqlite_sqliteset' || state == 'pgsql_pgsqlset') {\n\t\t\t\tchild_states.unshift(state.replace(/^[^_]+_/, ''));\n\t\t\t\ts_states = this.highlight_states(child_states, s, true);\n\t\t\t} else if ((state == 'php_quo' || state == 'php_apo') && /^(php_php|php_sql|php_sqlite|php_pgsql|php_mssql|php_oracle|php_phpini|php_http|php_mail)\$/.test(prev_state)) {\n\t\t\t\tchild_states.unshift(prev_state.substr(4));\n\t\t\t\ts_states = this.highlight_states(child_states, this.stripslashes(s), true, (state == 'php_apo' ? this.addslashes_apo : this.addslashes_quo));\n\t\t\t} else if (key == 'php_halt2') {\n\t\t\t\tchild_states.unshift('htm');\n\t\t\t\ts_states = this.highlight_states(child_states, s, true);\n\t\t\t} else if ((state == 'apo' || state == 'quo') && prev_state == 'js_write_code') {\n\t\t\t\tchild_states.unshift('htm');\n\t\t\t\ts_states = this.highlight_states(child_states, s, true);\n\t\t\t} else if ((state == 'apo' || state == 'quo') && prev_state == 'js_http_code') {\n\t\t\t\tchild_states.unshift('http');\n\t\t\t\ts_states = this.highlight_states(child_states, s, true);\n\t\t\t} else if (((state == 'php_quo' || state == 'php_apo') && prev_state == 'php_echo') || (state == 'php_eot2' && states[states.length - 3] == 'php_echo')) {\n\t\t\t\tvar i;\n\t\t\t\tfor (i=states.length; i--; ) {\n\t\t\t\t\tprev_state = states[i];\n\t\t\t\t\tif (prev_state.substring(0, 3) != 'php' && prev_state != 'att_quo' && prev_state != 'att_apo' && prev_state != 'att_val') {\n\t\t\t\t\t\tbreak;\n\t\t\t\t\t}\n\t\t\t\t\tprev_state = '';\n\t\t\t\t}\n\t\t\t\tvar f = (state == 'php_eot2' ? this.addslashes : (state == 'php_apo' ? this.addslashes_apo : this.addslashes_quo));\n\t\t\t\ts = this.stripslashes(s);\n\t\t\t\tif (/^(att_js|att_css|att_http)\$/.test(prev_state)) {\n\t\t\t\t\tvar g = (states[i+1] == 'att_quo' ? this.htmlspecialchars_quo : (states[i+1] == 'att_apo' ? this.htmlspecialchars_apo : this.htmlspecialchars_quo_apo));\n\t\t\t\t\tchild_states.unshift(prev_state == 'att_js' ? 'js' : prev_state.substr(4));\n\t\t\t\t\ts_states = this.highlight_states(child_states, this.html_entity_decode(s), true, function (string) { return f(g(string)); });\n\t\t\t\t} else if (prev_state && child_states) {\n\t\t\t\t\tchild_states.unshift(prev_state);\n\t\t\t\t\ts_states = this.highlight_states(child_states, s, true, f);\n\t\t\t\t} else {\n\t\t\t\t\ts = this.htmlspecialchars(s);\n\t\t\t\t\ts_states = [ (escape ? escape(s) : s), (!out || !/^(att_js|att_css|att_http|css_js|js_write_code|js_http_code|php_php|php_sql|php_sqlite|php_pgsql|php_mssql|php_oracle|php_echo|php_phpini|php_http|php_mail)\$/.test(state) ? child_states : [ ]) ];\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\ts = this.htmlspecialchars(s);\n\t\t\t\ts_states = [ (escape ? escape(s) : s), (!out || !/^(att_js|att_css|att_http|css_js|js_write_code|js_http_code|php_php|php_sql|php_sqlite|php_pgsql|php_mssql|php_oracle|php_echo|php_phpini|php_http|php_mail)\$/.test(state) ? child_states : [ ]) ]; // reset child states when leaving construct\n\t\t\t}\n\t\t\ts = s_states[0];\n\t\t\tchild_states = s_states[1];\n\t\t\ts = this.keywords_links(state, s);\n\t\t\tret.push(s);\n\n\t\t\ts = text.substring(division, match.index + match[0].length);\n\t\t\ts = (m.length < 3 ? (s ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(s) : s) + '</span>' : '') : (m[1] ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(m[1]) : m[1]) + '</span>' : '') + this.htmlspecialchars(escape ? escape(m[2]) : m[2]) + (m[3] ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(m[3]) : m[3]) + '</span>' : ''));\n\t\t\tif (!out) {\n\t\t\t\tif (this.links && this.links[key] && m[2]) {\n\t\t\t\t\tif (/^tag/.test(key)) {\n\t\t\t\t\t\tthis.last_tag = m[2].toLowerCase();\n\t\t\t\t\t}\n\t\t\t\t\tvar link = m[2].toLowerCase();\n\t\t\t\t\tvar k_link = '';\n\t\t\t\t\tfor (var k in this.links[key]) {\n\t\t\t\t\t\tvar m2 = this.links[key][k].exec(m[2]);\n\t\t\t\t\t\tif (m2) {\n\t\t\t\t\t\t\tif (m2[1]) {\n\t\t\t\t\t\t\t\tlink = m2[1].toLowerCase().replace(/\\\\/g, '-'); // \\ is PHP namespace;\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\tk_link = k;\n\t\t\t\t\t\t\tif (key != 'att') {\n\t\t\t\t\t\t\t\tbreak;\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t\tif (key == 'php_met') {\n\t\t\t\t\t\tthis.last_class = (k_link && !/^(self|parent|static|dir)\$/i.test(link) ? link : '');\n\t\t\t\t\t}\n\t\t\t\t\tif (k_link) {\n\t\t\t\t\t\ts = (m[1] ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(m[1]) : m[1]) + '</span>' : '');\n\t\t\t\t\t\ts += this.create_link(\n\t\t\t\t\t\t\t(/^https?:/.test(k_link) ? k_link : this.urls[key].replace(/\\\$key/, k_link))\n\t\t\t\t\t\t\t\t.replace(/\\\$val/, (/^https?:/.test(k_link) ? link.toLowerCase() : link))\n\t\t\t\t\t\t\t\t.replace(/\\\$tag/, this.last_tag),\n\t\t\t\t\t\t\tthis.htmlspecialchars(escape ? escape(m[2]) : m[2])); //! use jush.api\n\t\t\t\t\t\ts += (m[3] ? '<span class=\"jush-op\">' + this.htmlspecialchars(escape ? escape(m[3]) : m[3]) + '</span>' : '');\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tret.push('<span class=\"jush-' + key + '\">', s);\n\t\t\t\tstates.push(key);\n\t\t\t\tif (state == 'php_eot') {\n\t\t\t\t\tthis.tr.php_eot2._2 = new RegExp('(\\n)(' + match[1] + ')(;?\\n)');\n\t\t\t\t\tthis.build_regexp('php_eot2', (match[2] == \"'\" ? { _2: this.tr.php_eot2._2 } : this.tr.php_eot2));\n\t\t\t\t} else if (state == 'pgsql_eot') {\n\t\t\t\t\tthis.tr.pgsql_eot2._2 = new RegExp('\\\\\$' + match[0].replace(/\\\$/, '\\\\\$'));\n\t\t\t\t\tthis.build_regexp('pgsql_eot2', this.tr.pgsql_eot2);\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tif (state == 'php_met' && this.last_class) {\n\t\t\t\t\tvar title = (jush.api['php2'] ? jush.api['php2'][(this.last_class + '::' + s).toLowerCase()] : '');\n\t\t\t\t\ts = this.create_link(this.urls[state].replace(/\\\$key/, this.last_class) + '.' + s.toLowerCase(), s, (title ? ' title=\"' + this.htmlspecialchars_quo(title) + '\"' : ''));\n\t\t\t\t}\n\t\t\t\tret.push(s);\n\t\t\t\tfor (var i = Math.min(states.length, +key.substr(1)); i--; ) {\n\t\t\t\t\tret.push('</span>');\n\t\t\t\t\tstates.pop();\n\t\t\t\t}\n\t\t\t}\n\t\t\tstart = match.index + match[0].length;\n\t\t\tif (!states.length) { // out of states\n\t\t\t\tbreak;\n\t\t\t}\n\t\t\tstate = states[states.length - 1];\n\t\t\tthis.regexps[state].lastIndex = start;\n\t\t}\n\t\tret.push(this.keywords_links(state, this.htmlspecialchars(text.substring(start))));\n\t\tfor (var i=1; i < states.length; i++) {\n\t\t\tret.push('</span>');\n\t\t}\n\t\tstates.shift();\n\t\treturn [ ret.join(''), states ];\n\t},\n\n\t/** Replace <&> by HTML entities\n\t* @param string\n\t* @return string\n\t*/\n\thtmlspecialchars: function (string) {\n\t\treturn string.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\t},\n\n\thtmlspecialchars_quo: function (string) {\n\t\treturn jush.htmlspecialchars(string).replace(/\"/g, '&quot;'); // jush - this.htmlspecialchars_quo is passed as reference\n\t},\n\n\thtmlspecialchars_apo: function (string) {\n\t\treturn jush.htmlspecialchars(string).replace(/'/g, '&#39;');\n\t},\n\n\thtmlspecialchars_quo_apo: function (string) {\n\t\treturn jush.htmlspecialchars_quo(string).replace(/'/g, '&#39;');\n\t},\n\n\t/** Decode HTML entities\n\t* @param string\n\t* @return string\n\t*/\n\thtml_entity_decode: function (string) {\n\t\treturn string.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&nbsp;/g, '\\u00A0').replace(/&#(?:([0-9]+)|x([0-9a-f]+));/gi, function (str, p1, p2) { //! named entities\n\t\t\treturn String.fromCharCode(p1 ? p1 : parseInt(p2, 16));\n\t\t}).replace(/&amp;/g, '&');\n\t},\n\n\t/** Add backslash before backslash\n\t* @param string\n\t* @return string\n\t*/\n\taddslashes: function (string) {\n\t\treturn string.replace(/\\\\/g, '\\\\\$&');\n\t},\n\n\taddslashes_apo: function (string) {\n\t\treturn string.replace(/[\\\\']/g, '\\\\\$&');\n\t},\n\n\taddslashes_quo: function (string) {\n\t\treturn string.replace(/[\\\\\"]/g, '\\\\\$&');\n\t},\n\n\t/** Remove backslash before \\\"'\n\t* @param string\n\t* @return string\n\t*/\n\tstripslashes: function (string) {\n\t\treturn string.replace(/\\\\([\\\\\"'])/g, '\$1');\n\t}\n};\n\n\n\njush.tr = { // transitions - key: go inside this state, _2: go outside 2 levels (number alone is put to the beginning in Chrome)\n\t// regular expressions matching empty string could be used only in the last key\n\tquo: { php: jush.php, esc: /\\\\/, _1: /\"/ },\n\tapo: { php: jush.php, esc: /\\\\/, _1: /'/ },\n\tcom: { php: jush.php, _1: /\\*\\// },\n\tcom_nest: { com_nest: /\\/\\*/, _1: /\\*\\// },\n\tphp: { _1: /\\?>/ }, // overwritten by jush-php.js\n\tesc: { _1: /./ }, //! php_quo allows [0-7]{1,3} and x[0-9A-Fa-f]{1,2}\n\tone: { _1: /(?=\\n)/ },\n\tnum: { _1: /()/ },\n\n\tsql_apo: { esc: /\\\\/, _0: /''/, _1: /'/ },\n\tsql_quo: { esc: /\\\\/, _0: /\"\"/, _1: /\"/ },\n\tsql_var: { _1: /(?=[^_.\$a-zA-Z0-9])/ },\n\tsqlite_apo: { _0: /''/, _1: /'/ },\n\tsqlite_quo: { _0: /\"\"/, _1: /\"/ },\n\tbac: { _1: /`/ },\n\tbra: { _1: /]/ }\n};\n\n// string: \$key stands for key in jush.links, \$val stands for found string\n// array: [0] is base, other elements correspond to () in jush.links2, \$key stands for text of selected element, \$1 stands for found string\njush.urls = { };\njush.links = { };\njush.links2 = { }; // first and last () is used as delimiter\n/** Get callback for autocompletition\n* @param string escaped empty identifier, e.g. `` for MySQL or [] for MS SQL\n* @param Object<string, Array<string>> keys are table names, values are lists of columns\n* @return Function see autocomplete()\n*/\njush.autocompleteSql = function (esc, tablesColumns) {\n\t/**\n\t* key: regular expression; ' ' will be expanded to '\\\\s+', '\\\\w' to esc[0]+'?\\\\w'+esc[1]+'?', '\$' will be appended\n\t* value: list of autocomplete words; '?' means to not use the word if it's already in the current query\n\t*/\n\tconst keywordsDefault = {\n\t\t'^': ['SELECT', 'INSERT INTO', 'UPDATE', 'DELETE FROM', 'EXPLAIN'],\n\t\t'^EXPLAIN ': ['SELECT'],\n\t\t'^INSERT ': ['IGNORE'],\n\t\t'^INSERT .+\\\\) ': ['?VALUES', 'ON DUPLICATE KEY UPDATE'],\n\t\t'^UPDATE \\\\w+ ': ['SET'],\n\t\t'^UPDATE \\\\w+ SET .+ ': ['?WHERE'],\n\t\t'^DELETE FROM \\\\w+ ': ['WHERE'],\n\t\t' JOIN \\\\w+(( AS)? (?!(ON|USING|AS) )\\\\w+)? ': ['ON', 'USING'],\n\t\t'\\\\bSELECT ': ['*', 'DISTINCT'],\n\t\t'\\\\bSELECT .+ ': ['?FROM'],\n\t\t'\\\\bSELECT (?!.* (WHERE|GROUP BY|HAVING|ORDER BY|LIMIT) ).+ FROM .+ ': ['INNER JOIN', 'LEFT JOIN', '?WHERE'],\n\t\t'\\\\bSELECT (?!.* (HAVING|ORDER BY|LIMIT|OFFSET) ).+ FROM .+ ': ['?GROUP BY'],\n\t\t'\\\\bSELECT (?!.* (ORDER BY|LIMIT|OFFSET) ).+ FROM .+ ': ['?HAVING'],\n\t\t'\\\\bSELECT (?!.* (LIMIT|OFFSET) ).+ FROM .+ ': ['?ORDER BY'], // this matches prefixes without LIMIT|OFFSET and offers ORDER BY if it's not already used in prefix or suffix\n\t\t'\\\\bSELECT (?!.* (OFFSET) ).+ FROM .+ ': ['?LIMIT', '?OFFSET'],\n\t\t' ORDER BY (?!.* (LIMIT|OFFSET) ).+ ': ['DESC'],\n\t};\n\t\n\t/** Get list of strings for autocompletion\n\t* @param string\n\t* @param string\n\t* @param string\n\t* @return Object<string, number> keys are words, values are offsets\n\t*/\n\tfunction autocomplete(state, before, after) {\n\t\tif (/^(one|com|sql_apo|sqlite_apo)\$/.test(state)) {\n\t\t\treturn {};\n\t\t}\n\t\tbefore = before\n\t\t\t.replace(/\\/\\*.*?\\*\\/|\\s--[^\\n]*|'[^']+'/s, '') // strip comments and strings\n\t\t\t.replace(/.*;/s, '') // strip previous query\n\t\t\t.trimStart()\n\t\t;\n\t\tafter = after.replace(/;.*/s, ''); // strip next query\n\t\tconst query = before + after;\n\t\tconst allTables = Object.keys(tablesColumns);\n\t\tconst usedTables = findTables(query); // tables used by the current query\n\t\tconst uniqueColumns = {};\n\t\tfor (const table of Object.values(usedTables)) {\n\t\t\tfor (const column of tablesColumns[table]) {\n\t\t\t\tuniqueColumns[column] = 0;\n\t\t\t}\n\t\t}\n\t\tconst columns = Object.keys(uniqueColumns);\n\t\tif (columns.length > 50) {\n\t\t\tcolumns.length = 0;\n\t\t}\n\t\tif (Object.keys(usedTables).length > 1) {\n\t\t\tfor (const alias in usedTables) {\n\t\t\t\tcolumns.push(alias + '.');\n\t\t\t}\n\t\t}\n\t\t\n\t\tconst preferred = {\n\t\t\t'\\\\b(FROM|INTO|^UPDATE|JOIN) ': allTables, // all tables including the current ones (self-join)\n\t\t\t'\\\\b(^INSERT|USING) [^(]*\\\\(([^)]+, )?': columns, // offer columns right after '(' or after ','\n\t\t\t'(^UPDATE .+ SET| DUPLICATE KEY UPDATE| BY) (.+, )?': columns,\n\t\t\t' (WHERE|HAVING|AND|OR|ON|=) ': columns,\n\t\t};\n\t\tkeywordsDefault['\\\\bSELECT( DISTINCT)? (?!.* FROM )(.+, )?'] = columns; // this is not in preferred because we prefer '*'\n\t\t\n\t\tconst context = before.replace(escRe('[\\\\w`]+\$'), ''); // in 'UPDATE tab.`co', context is 'UPDATE tab.'\n\t\tbefore = before.replace(escRe('.*[^\\\\w`]', 's'), ''); // in 'UPDATE tab.`co', before is '`co'\n\t\t\n\t\tconst thisColumns = []; // columns in the current table ('table.')\n\t\tconst match = context.match(escRe('`?(\\\\w+)`?\\\\.\$'));\n\t\tif (match) {\n\t\t\tlet table = match[1];\n\t\t\tif (!tablesColumns[table]) {\n\t\t\t\ttable = usedTables[table];\n\t\t\t}\n\t\t\tif (tablesColumns[table]) {\n\t\t\t\tthisColumns.push(...tablesColumns[table]);\n\t\t\t\tpreferred['\\\\.'] = thisColumns;\n\t\t\t}\n\t\t}\n\n\t\tif (query.includes(esc[0]) && !/^\\w/.test(before)) { // if there's any ` in the query, use ` everywhere unless the user starts typing letters\n\t\t\tallTables.forEach(addEsc);\n\t\t\tcolumns.forEach(addEsc);\n\t\t\tthisColumns.forEach(addEsc);\n\t\t}\n\t\t\n\t\tconst ac = {};\n\t\tfor (const keywords of [preferred, keywordsDefault]) {\n\t\t\tfor (const re in keywords) {\n\t\t\t\tif (context.match(escRe(re.replace(/ /g, '\\\\s+').replace(/\\\\w\\+/g, '`?\\\\w+`?') + '\$', 'is'))) {\n\t\t\t\t\tfor (let keyword of keywords[re]) {\n\t\t\t\t\t\tif (keyword[0] == '?') {\n\t\t\t\t\t\t\tkeyword = keyword.substring(1);\n\t\t\t\t\t\t\tif (query.match(new RegExp('\\\\s+' + keyword + '\\\\s+', 'i'))) {\n\t\t\t\t\t\t\t\tcontinue;\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}\n\t\t\t\t\t\tif (keyword.length > before.length && keyword.toUpperCase().startsWith(before.toUpperCase())) {\n\t\t\t\t\t\t\tconst isCol = (keywords[re] == columns || keywords[re] == thisColumns);\n\t\t\t\t\t\t\tac[keyword + (isCol ? '' : ' ')] = before.length;\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\t\n\t\treturn ac;\n\t}\n\t\n\tfunction addEsc(val, key, array) {\n\t\tarray[key] = esc[0] + val.replace(/\\.?\$/, esc[1] + '\$&');\n\t}\n\n\t/** Change odd ` to esc[0], even to esc[1] */\n\tfunction escRe(re, flags) {\n\t\tlet i = 0;\n\t\treturn new RegExp(re.replace(/`/g, () => (esc[0] == '[' ? '\\\\' : '') + esc[i++ % 2]), flags);\n\t}\n\n\t/** @return Object<string, string> key is alias, value is actual table */\n\tfunction findTables(query) {\n\t\tconst matches = query.matchAll(escRe('\\\\b(FROM|JOIN|INTO|UPDATE)\\\\s+(\\\\w+|`.+?`)((\\\\s+AS)?\\\\s+((?!(LEFT|INNER|JOIN|ON|USING|WHERE|GROUP|HAVING|ORDER|LIMIT)\\\\b)\\\\w+|`.+?`))?', 'gi')); //! handle `abc``def`\n\t\tconst result = {};\n\t\tfor (const match of matches) {\n\t\t\tconst table = match[2].replace(escRe('^`|`\$', 'g'), '');\n\t\t\tconst alias = (match[5] ? match[5].replace(escRe('^`|`\$', 'g'), '') : table);\n\t\t\tif (tablesColumns[table]) {\n\t\t\t\tresult[alias] = table;\n\t\t\t}\n\t\t}\n\t\tif (!Object.keys(result).length) {\n\t\t\tfor (const table in tablesColumns) {\n\t\t\t\tresult[table] = table;\n\t\t\t}\n\t\t}\n\t\treturn result;\n\t}\n\n\t// we open the autocomplete on word character, space, '(', '.' and '`'; textarea also triggers it on Backspace and Ctrl+Space\n\tautocomplete.openBy = escRe('^[\\\\w`(. ]\$'); //! ignore . in 1.23\n\n\treturn autocomplete;\n};\njush.textarea = (function () {\n\t//! IE sometimes inserts empty <p> in start of a string when newline is entered inside\n\t\n\tfunction findSelPos(pre) {\n\t\tvar sel = getSelection();\n\t\tif (sel.rangeCount) {\n\t\t\tvar range = sel.getRangeAt(0);\n\t\t\treturn findPosition(pre, range.startContainer, range.startOffset);\n\t\t}\n\t}\n\n\tfunction findPosition(el, container, offset) {\n\t\tvar pos = { pos: 0 };\n\t\tfindPositionRecurse(el, container, offset, pos);\n\t\treturn pos.pos;\n\t}\n\n\tfunction findPositionRecurse(child, container, offset, pos) {\n\t\tif (child.nodeType == 3) {\n\t\t\tif (child == container) {\n\t\t\t\tpos.pos += offset;\n\t\t\t\treturn true;\n\t\t\t}\n\t\t\tpos.pos += child.textContent.length;\n\t\t} else if (child == container) {\n\t\t\tfor (var i = 0; i < offset; i++) {\n\t\t\t\tfindPositionRecurse(child.childNodes[i], container, offset, pos);\n\t\t\t}\n\t\t\treturn true;\n\t\t} else {\n\t\t\tif (/^(br|div)\$/i.test(child.tagName)) {\n\t\t\t\tpos.pos++;\n\t\t\t}\n\t\t\tfor (var i = 0; i < child.childNodes.length; i++) {\n\t\t\t\tif (findPositionRecurse(child.childNodes[i], container, offset, pos)) {\n\t\t\t\t\treturn true;\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (/^p\$/i.test(child.tagName)) {\n\t\t\t\tpos.pos++;\n\t\t\t}\n\t\t}\n\t}\n\t\n\tfunction findOffset(el, pos) {\n\t\treturn findOffsetRecurse(el, { pos: pos });\n\t}\n\t\n\tfunction findOffsetRecurse(child, pos) {\n\t\tif (child.nodeType == 3) { // 3 - TEXT_NODE\n\t\t\tif (child.textContent.length >= pos.pos) {\n\t\t\t\treturn { container: child, offset: pos.pos };\n\t\t\t}\n\t\t\tpos.pos -= child.textContent.length;\n\t\t} else {\n\t\t\tfor (var i = 0; i < child.childNodes.length; i++) {\n\t\t\t\tif (/^br\$/i.test(child.childNodes[i].tagName)) {\n\t\t\t\t\tif (!pos.pos) {\n\t\t\t\t\t\treturn { container: child, offset: i };\n\t\t\t\t\t}\n\t\t\t\t\tpos.pos--;\n\t\t\t\t\tif (!pos.pos && i == child.childNodes.length - 1) { // last invisible <br>\n\t\t\t\t\t\treturn { container: child, offset: i };\n\t\t\t\t\t}\n\t\t\t\t} else {\n\t\t\t\t\tvar result = findOffsetRecurse(child.childNodes[i], pos);\n\t\t\t\t\tif (result) {\n\t\t\t\t\t\treturn result;\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\t\n\tfunction setSelPos(pre, pos) {\n\t\tif (pos) {\n\t\t\tvar start = findOffset(pre, pos);\n\t\t\tif (start) {\n\t\t\t\tvar range = document.createRange();\n\t\t\t\trange.setStart(start.container, start.offset);\n\t\t\t\tvar sel = getSelection();\n\t\t\t\tsel.removeAllRanges();\n\t\t\t\tsel.addRange(range);\n\t\t\t}\n\t\t}\n\t}\n\n\tfunction setText(pre, text, end) {\n\t\tvar lang = 'txt';\n\t\tif (text.length < 1e4) { // highlighting is slow with most languages\n\t\t\tvar match = /(^|\\s)(?:jush|language)-(\\S+)/.exec(pre.jushTextarea.className);\n\t\t\tlang = (match ? match[2] : 'htm');\n\t\t}\n\t\tvar html = jush.highlight(lang, text).replace(/\\n/g, '<br>');\n\t\tsetHTML(pre, html, text, end);\n\t\tif (openAc) {\n\t\t\topenAutocomplete(pre);\n\t\t\topenAc = false;\n\t\t} else {\n\t\t\tcloseAutocomplete();\n\t\t}\n\t}\n\t\n\tfunction setHTML(pre, html, text, pos) {\n\t\tpre.innerHTML = html;\n\t\tpre.lastHTML = pre.innerHTML; // not html because IE reformats the string\n\t\tpre.jushTextarea.value = text;\n\t\tsetSelPos(pre, pos);\n\t}\n\t\n\tfunction keydown(event) {\n\t\tconst ctrl = (event.ctrlKey || event.metaKey);\n\t\tif (!event.altKey) {\n\t\t\tif (!ctrl && acEl.options.length) {\n\t\t\t\tconst select =\n\t\t\t\t\t(event.key == 'ArrowDown' ? Math.min(acEl.options.length - 1, acEl.selectedIndex + 1) :\n\t\t\t\t\t(event.key == 'ArrowUp' ? Math.max(0, acEl.selectedIndex - 1) :\n\t\t\t\t\t(event.key == 'PageDown' ? Math.min(acEl.options.length - 1, acEl.selectedIndex + acEl.size) :\n\t\t\t\t\t(event.key == 'PageUp' ? Math.max(0, acEl.selectedIndex - acEl.size) :\n\t\t\t\t\tnull))))\n\t\t\t\t;\n\t\t\t\tif (select !== null) {\n\t\t\t\t\tacEl.selectedIndex = select;\n\t\t\t\t\treturn false;\n\t\t\t\t}\n\t\t\t\tif (/^(Enter|Tab)\$/.test(event.key) && !event.shiftKey) {\n\t\t\t\t\tinsertAutocomplete(this);\n\t\t\t\t\treturn false;\n\t\t\t\t}\n\t\t\t}\n\t\t\t\n\t\t\tif (ctrl) {\n\t\t\t\tif (event.key == ' ') {\n\t\t\t\t\topenAutocomplete(this);\n\t\t\t\t}\n\t\t\t} else if (autocomplete.openBy && (autocomplete.openBy.test(event.key) || event.key == 'Backspace' || (event.key == 'Enter' && event.shiftKey))) {\n\t\t\t\topenAc = true;\n\t\t\t} else if (/^(Escape|ArrowLeft|ArrowRight|Home|End)\$/.test(event.key)) {\n\t\t\t\tcloseAutocomplete();\n\t\t\t}\n\t\t}\n\t\t\n\t\tif (ctrl && !event.altKey) {\n\t\t\tvar isUndo = (event.keyCode == 90); // 90 - z\n\t\t\tvar isRedo = (event.keyCode == 89 || (event.keyCode == 90 && event.shiftKey)); // 89 - y\n\t\t\tif (isUndo || isRedo) {\n\t\t\t\tif (isRedo) {\n\t\t\t\t\tif (this.jushUndoPos + 1 < this.jushUndo.length) {\n\t\t\t\t\t\tthis.jushUndoPos++;\n\t\t\t\t\t\tvar undo = this.jushUndo[this.jushUndoPos];\n\t\t\t\t\t\tsetText(this, undo.text, undo.end)\n\t\t\t\t\t}\n\t\t\t\t} else if (this.jushUndoPos >= 0) {\n\t\t\t\t\tthis.jushUndoPos--;\n\t\t\t\t\tvar undo = this.jushUndo[this.jushUndoPos] || { html: '', text: '' };\n\t\t\t\t\tsetText(this, undo.text, this.jushUndo[this.jushUndoPos + 1].start);\n\t\t\t\t}\n\t\t\t\treturn false;\n\t\t\t}\n\t\t} else {\n\t\t\tsetLastPos(this);\n\t\t}\n\t}\n\t\n\tconst maxSize = 8;\n\tconst acEl = document.createElement('select');\n\tacEl.size = maxSize;\n\tacEl.className = 'jush-autocomplete';\n\tacEl.style.position = 'absolute';\n\tacEl.style.zIndex = 1;\n\tacEl.onclick = () => {\n\t\tinsertAutocomplete(pre);\n\t};\n\topenAc = false;\n\tcloseAutocomplete();\n\n\tfunction findState(node) {\n\t\tlet match;\n\t\twhile (node && (!/^(CODE|PRE)\$/.test(node.tagName) || !(match = node.className.match(/(^|\\s)jush-(\\w+)/)))) {\n\t\t\tnode = node.parentElement;\n\t\t}\n\t\treturn (match ? match[2] : '');\n\t}\n\n\tfunction openAutocomplete(pre) {\n\t\tconst prevSelected = acEl.options[acEl.selectedIndex];\n\t\tcloseAutocomplete();\n\t\tconst sel = getSelection();\n\t\tif (sel.rangeCount) {\n\t\t\tconst range = sel.getRangeAt(0);\n\t\t\tconst pos = findSelPos(pre);\n\t\t\tconst state = findState(range.startContainer);\n\t\t\tif (state) {\n\t\t\t\tconst ac = autocomplete(\n\t\t\t\t\tstate,\n\t\t\t\t\tpre.innerText.substring(0, pos),\n\t\t\t\t\tpre.innerText.substring(pos)\n\t\t\t\t);\n\t\t\t\tif (Object.keys(ac).length) {\n\t\t\t\t\tlet select = 0;\n\t\t\t\t\tfor (const word in ac) {\n\t\t\t\t\t\tconst option = document.createElement('option');\n\t\t\t\t\t\toption.value = ac[word];\n\t\t\t\t\t\toption.textContent = word;\n\t\t\t\t\t\tacEl.append(option);\n\t\t\t\t\t\tif (prevSelected && prevSelected.textContent == word) {\n\t\t\t\t\t\t\tselect = acEl.options.length - 1;\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t\tacEl.selectedIndex = select;\n\t\t\t\t\tacEl.size = Math.min(Math.max(acEl.options.length, 2), maxSize);\n\t\t\t\t\tpositionAutocomplete();\n\t\t\t\t\tacEl.style.display = '';\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\t\n\tfunction positionAutocomplete() {\n\t\tconst sel = getSelection();\n\t\tif (sel.rangeCount && acEl.options.length) {\n\t\t\tconst pos = findSelPos(pre);\n\t\t\tconst range = sel.getRangeAt(0);\n\t\t\tconst range2 = range.cloneRange();\n\t\t\trange2.setStart(range.startContainer, Math.max(0, range.startOffset - acEl.options[0].value)); // autocompletions currently couldn't cross container boundary\n\t\t\tconst span = document.createElement('span'); // collapsed ranges have empty bounding rect\n\t\t\trange2.insertNode(span);\n\t\t\tacEl.style.left = span.offsetLeft + 'px';\n\t\t\tacEl.style.top = (span.offsetTop + 20) + 'px';\n\t\t\tspan.remove();\n\t\t\tsetSelPos(pre, pos); // required on iOS\n\t\t}\n\t}\n\t\n\tfunction closeAutocomplete() {\n\t\tacEl.options.length = 0;\n\t\tacEl.style.display = 'none';\n\t}\n\t\n\tfunction insertAutocomplete(pre) {\n\t\tconst sel = getSelection();\n\t\tconst range = sel.rangeCount && sel.getRangeAt(0);\n\t\tif (range) {\n\t\t\tconst insert = acEl.options[acEl.selectedIndex].textContent;\n\t\t\tconst offset = +acEl.options[acEl.selectedIndex].value;\n\t\t\tforceNewUndo = true;\n\t\t\tpre.lastPos = findSelPos(pre);\n\t\t\tconst start = findOffset(pre, pre.lastPos - offset);\n\t\t\tif (start) {\n\t\t\t\trange.setStart(start.container, start.offset);\n\t\t\t}\n\t\t\tdocument.execCommand('insertText', false, insert);\n\t\t\topenAutocomplete(pre);\n\t\t}\n\t}\n\t\n\tfunction setLastPos(pre) {\n\t\tif (pre.lastPos === undefined) {\n\t\t\tpre.lastPos = findSelPos(pre);\n\t\t}\n\t}\n\t\n\tvar forceNewUndo = true;\n\t\n\tfunction highlight(pre) {\n\t\tvar start = pre.lastPos;\n\t\tpre.lastPos = undefined;\n\t\tvar innerHTML = pre.innerHTML;\n\t\tif (innerHTML != pre.lastHTML) {\n\t\t\tvar end = findSelPos(pre);\n\t\t\tinnerHTML = innerHTML.replace(/<br>((<\\/[^>]+>)*<\\/?div>)(?!\$)/gi, function (all, rest) {\n\t\t\t\tif (end) {\n\t\t\t\t\tend--;\n\t\t\t\t}\n\t\t\t\treturn rest;\n\t\t\t});\n\t\t\tpre.innerHTML = innerHTML\n\t\t\t\t.replace(/<(br|div)\\b[^>]*>/gi, '\\n') // Firefox, Chrome\n\t\t\t\t.replace(/&nbsp;(<\\/[pP]\\b)/g, '\$1') // IE\n\t\t\t\t.replace(/<\\/p\\b[^>]*>(\$|<p\\b[^>]*>)/gi, '\\n') // IE\n\t\t\t\t.replace(/(&nbsp;)+\$/gm, '') // Chrome for some users\n\t\t\t;\n\t\t\tsetText(pre, pre.textContent.replace(/\\u00A0/g, ' '), end);\n\t\t\tpre.jushUndo.length = pre.jushUndoPos + 1;\n\t\t\tif (forceNewUndo || !pre.jushUndo.length || pre.jushUndo[pre.jushUndoPos].end !== start) {\n\t\t\t\tpre.jushUndo.push({ text: pre.jushTextarea.value, start: start, end: (forceNewUndo ? undefined : end) });\n\t\t\t\tpre.jushUndoPos++;\n\t\t\t\tforceNewUndo = false;\n\t\t\t} else {\n\t\t\t\tpre.jushUndo[pre.jushUndoPos].text = pre.jushTextarea.value;\n\t\t\t\tpre.jushUndo[pre.jushUndoPos].end = end;\n\t\t\t}\n\t\t}\n\t}\n\t\n\tfunction input() {\n\t\thighlight(this);\n\t}\n\t\n\tfunction paste(event) {\n\t\tif (event.clipboardData) {\n\t\t\tsetLastPos(this);\n\t\t\tif (document.execCommand('insertHTML', false, jush.htmlspecialchars(event.clipboardData.getData('text')))) { // Opera doesn't support insertText\n\t\t\t\tevent.preventDefault();\n\t\t\t}\n\t\t\tforceNewUndo = true; // highlighted in input\n\t\t}\n\t}\n\t\n\tfunction click(event) {\n\t\tif ((event.ctrlKey || event.metaKey) && event.target.href) {\n\t\t\topen(event.target.href);\n\t\t}\n\t\tcloseAutocomplete();\n\t}\n\t\n\tlet pre;\n\tlet autocomplete = () => ({});\n\taddEventListener('resize', positionAutocomplete);\n\t\n\treturn function textarea(el, autocompleter) {\n\t\tif (!window.getSelection) {\n\t\t\treturn;\n\t\t}\n\t\tif (autocompleter) {\n\t\t\tautocomplete = autocompleter;\n\t\t}\n\t\tpre = document.createElement('pre');\n\t\tpre.contentEditable = true;\n\t\tpre.className = el.className + ' jush';\n\t\tpre.style.border = '1px inset #ccc';\n\t\tpre.style.width = el.clientWidth + 'px';\n\t\tpre.style.height = el.clientHeight + 'px';\n\t\tpre.style.padding = '3px';\n\t\tpre.style.overflow = 'auto';\n\t\tpre.style.resize = 'both';\n\t\tif (el.wrap != 'off') {\n\t\t\tpre.style.whiteSpace = 'pre-wrap';\n\t\t}\n\t\tpre.jushTextarea = el;\n\t\tpre.jushUndo = [ ];\n\t\tpre.jushUndoPos = -1;\n\t\tpre.onkeydown = keydown;\n\t\tpre.oninput = input;\n\t\tpre.onpaste = paste;\n\t\tpre.onclick = click;\n\t\tpre.appendChild(document.createTextNode(el.value));\n\t\thighlight(pre);\n\t\tif (el.spellcheck === false) {\n\t\t\tpre.spellcheck = false;\n\t\t}\n\t\tel.before(pre);\n\t\tel.before(acEl);\n\t\tif (document.activeElement === el) {\n\t\t\tpre.focus();\n\t\t\tif (!el.value) {\n\t\t\t\topenAutocomplete(pre);\n\t\t\t}\n\t\t}\n\t\tacEl.style.font = getComputedStyle(pre).font;\n\t\tel.style.display = 'none';\n\t\treturn pre;\n\t};\n})();\njush.tr.txt = { php: jush.php };\njush.tr.js = { php: jush.php, js_reg: /\\s*\\/(?![\\/*])/, js_obj: /\\s*\\{/, _1: /}/, js_code: /()/ };\njush.tr.js_code = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, js_doc: /\\/\\*\\*/, com: /\\/\\*/, num: jush.num, js_write: /(\\b)(write(?:ln)?)(\\()/, js_http: /(\\.)(setRequestHeader|getResponseHeader)(\\()/, js: /\\{/, _3: /(<)(\\/script)(>)/i, _2: /}/, _1: /[^.\\])}\$\\w\\s]/ };\njush.tr.js_write = { php: jush.php, js_reg: /\\s*\\/(?![\\/*])/, js_write_code: /()/ };\njush.tr.js_http = { php: jush.php, js_reg: /\\s*\\/(?![\\/*])/, js_http_code: /()/ };\njush.tr.js_write_code = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, js_write: /\\(/, _2: /\\)/, _1: /[^\\])}\$\\w\\s]/ };\njush.tr.js_http_code = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, js_http: /\\(/, _2: /\\)/, _1: /[^\\])}\$\\w\\s]/ };\njush.tr.js_one = { php: jush.php, _1: /\\n/, _3: /(<)(\\/script)(>)/i };\njush.tr.js_reg = { php: jush.php, esc: /\\\\/, js_reg_bra: /\\[/, _1: /\\/[a-z]*/i }; //! highlight regexp\njush.tr.js_reg_bra = { php: jush.php, esc: /\\\\/, _1: /]/ };\njush.tr.js_doc = { _1: /\\*\\// };\njush.tr.js_arr = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, js_arr: /\\[/, js_obj: /\\{/, _1: /]/ };\njush.tr.js_obj = { php: jush.php, js_one: /\\s*\\/\\//, com: /\\s*\\/\\*/, js_val: /:/, _1: /\\s*}/, js_key: /()/ };\njush.tr.js_val = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, js_arr: /\\[/, js_obj: /\\{/, _1: /,|(?=})/ };\njush.tr.js_key = { php: jush.php, quo: /\"/, apo: /'/, js_bac: /`/, js_one: /\\/\\//, com: /\\/\\*/, num: jush.num, _1: /(?=[:}])/ };\njush.tr.js_bac = { php: jush.php, esc: /\\\\/, js: /\\\$\\{/, _1: /`/ };\n\njush.urls.js_write = 'https://developer.mozilla.org/en/docs/DOM/\$key.\$val';\njush.urls.js_http = 'https://www.w3.org/TR/XMLHttpRequest/#the-\$val-\$key';\njush.urls.js = ['https://developer.mozilla.org/en/\$key',\n\t'JavaScript/Reference/Global_Objects/\$1',\n\t'JavaScript/Reference/Statements/\$1',\n\t'JavaScript/Reference/Statements/do...while',\n\t'JavaScript/Reference/Statements/if...else',\n\t'JavaScript/Reference/Statements/try...catch',\n\t'JavaScript/Reference/Operators/Special/\$1',\n\t'DOM/document.\$1', 'DOM/element.\$1', 'DOM/event.\$1', 'DOM/form.\$1', 'DOM/table.\$1', 'DOM/window.\$1',\n\t'https://www.w3.org/TR/XMLHttpRequest/',\n\t'JavaScript/Reference/Global_Objects/Array.\$1',\n\t'JavaScript/Reference/Global_Objects/Array\$1',\n\t'JavaScript/Reference/Global_Objects/Date\$1',\n\t'JavaScript/Reference/Global_Objects/Function\$1',\n\t'JavaScript/Reference/Global_Objects/Number\$1',\n\t'JavaScript/Reference/Global_Objects/RegExp\$1',\n\t'JavaScript/Reference/Global_Objects/String\$1'\n];\njush.urls.js_doc = ['https://code.google.com/p/jsdoc-toolkit/wiki/Tag\$key',\n\t'\$1', 'Param', 'Augments', '\$1'\n];\n\njush.links.js_write = { 'document': /^(write|writeln)\$/ };\njush.links.js_http = { 'method': /^(setRequestHeader|getResponseHeader)\$/ };\n\njush.links2.js = /(\\b)(String\\.fromCharCode|Date\\.(?:parse|UTC)|Math\\.(?:E|LN2|LN10|LOG2E|LOG10E|PI|SQRT1_2|SQRT2|abs|acos|asin|atan|atan2|ceil|cos|exp|floor|log|max|min|pow|random|round|sin|sqrt|tan)|Array|Boolean|Date|Error|Function|JavaArray|JavaClass|JavaObject|JavaPackage|Math|Number|Object|Packages|RegExp|String|Infinity|JSON|NaN|undefined|Error|EvalError|RangeError|ReferenceError|SyntaxError|TypeError|URIError|decodeURI|decodeURIComponent|encodeURI|encodeURIComponent|eval|isFinite|isNaN|parseFloat|parseInt|(break|continue|for|function|return|switch|throw|var|while|with)|(do)|(if|else)|(try|catch|finally)|(delete|in|instanceof|new|this|typeof|void)|(alinkColor|anchors|applets|bgColor|body|characterSet|compatMode|contentType|cookie|defaultView|designMode|doctype|documentElement|domain|embeds|fgColor|forms|height|images|implementation|lastModified|linkColor|links|plugins|popupNode|referrer|styleSheets|title|tooltipNode|URL|vlinkColor|width|clear|createAttribute|createDocumentFragment|createElement|createElementNS|createEvent|createNSResolver|createRange|createTextNode|createTreeWalker|evaluate|execCommand|getElementById|getElementsByName|importNode|loadOverlay|queryCommandEnabled|queryCommandIndeterm|queryCommandState|queryCommandValue|write|writeln)|(attributes|childNodes|className|clientHeight|clientLeft|clientTop|clientWidth|dir|firstChild|id|innerHTML|lang|lastChild|localName|name|namespaceURI|nextSibling|nodeName|nodeType|nodeValue|offsetHeight|offsetLeft|offsetParent|offsetTop|offsetWidth|ownerDocument|parentNode|prefix|previousSibling|scrollHeight|scrollLeft|scrollTop|scrollWidth|style|tabIndex|tagName|textContent|addEventListener|appendChild|blur|click|cloneNode|dispatchEvent|focus|getAttribute|getAttributeNS|getAttributeNode|getAttributeNodeNS|getElementsByTagName|getElementsByTagNameNS|hasAttribute|hasAttributeNS|hasAttributes|hasChildNodes|insertBefore|item|normalize|removeAttribute|removeAttributeNS|removeAttributeNode|removeChild|removeEventListener|replaceChild|scrollIntoView|setAttribute|setAttributeNS|setAttributeNode|setAttributeNodeNS|supports|onblur|onchange|onclick|ondblclick|onfocus|onkeydown|onkeypress|onkeyup|onmousedown|onmousemove|onmouseout|onmouseover|onmouseup|onresize)|(altKey|bubbles|button|cancelBubble|cancelable|clientX|clientY|ctrlKey|currentTarget|detail|eventPhase|explicitOriginalTarget|isChar|layerX|layerY|metaKey|originalTarget|pageX|pageY|relatedTarget|screenX|screenY|shiftKey|target|timeStamp|type|view|which|initEvent|initKeyEvent|initMouseEvent|initUIEvent|stopPropagation|preventDefault)|(elements|name|acceptCharset|action|enctype|encoding|method|submit|reset)|(caption|tHead|tFoot|rows|tBodies|align|bgColor|border|cellPadding|cellSpacing|frame|rules|summary|width|createTHead|deleteTHead|createTFoot|deleteTFoot|createCaption|deleteCaption|insertRow|deleteRow)|(content|closed|controllers|crypto|defaultStatus|directories|document|frameElement|frames|history|innerHeight|innerWidth|location|locationbar|menubar|name|navigator|opener|outerHeight|outerWidth|pageXOffset|pageYOffset|parent|personalbar|pkcs11|screen|availTop|availLeft|availHeight|availWidth|colorDepth|height|left|pixelDepth|top|width|scrollbars|scrollMaxX|scrollMaxY|scrollX|scrollY|self|sidebar|status|statusbar|toolbar|window|alert|atob|back|btoa|captureEvents|clearInterval|clearTimeout|close|confirm|dump|escape|find|forward|getAttention|getComputedStyle|getSelection|home|moveBy|moveTo|open|openDialog|print|prompt|releaseEvents|resizeBy|resizeTo|scroll|scrollBy|scrollByLines|scrollByPages|scrollTo|setInterval|setTimeout|sizeToContent|stop|unescape|updateCommands|onabort|onclose|ondragdrop|onerror|onload|onpaint|onreset|onscroll|onselect|onsubmit|onunload)|(XMLHttpRequest)|(length))\\b|(\\.(?:pop|push|reverse|shift|sort|splice|unshift|concat|join|slice)|(\\.(?:getDate|getDay|getFullYear|getHours|getMilliseconds|getMinutes|getMonth|getSeconds|getTime|getTimezoneOffset|getUTCDate|getUTCDay|getUTCFullYear|getUTCHours|getUTCMilliseconds|getUTCMinutes|getUTCMonth|getUTCSeconds|setDate|setFullYear|setHours|setMilliseconds|setMinutes|setMonth|setSeconds|setTime|setUTCDate|setUTCFullYear|setUTCHours|setUTCMilliseconds|setUTCMinutes|setUTCMonth|setUTCSeconds|toDateString|toLocaleDateString|toLocaleTimeString|toTimeString|toUTCString))|(\\.(?:apply|call))|(\\.(?:toExponential|toFixed|toPrecision))|(\\.(?:exec|test))|(\\.(?:charAt|charCodeAt|concat|indexOf|lastIndexOf|localeCompare|match|replace|search|slice|split|substr|substring|toLocaleLowerCase|toLocaleUpperCase|toLowerCase|toUpperCase)))(\\s*\\(|\$)/g; // collisions: bgColor, height, width, length, name\njush.links2.js_doc = /(^[ \\t]*|\\n\\s*\\*\\s*|(?={))(@(?:augments|author|borrows|class|constant|constructor|constructs|default|deprecated|description|event|example|field|fileOverview|function|ignore|inner|lends|memberOf|name|namespace|param|private|property|public|requires|returns|see|since|static|throws|type|version)|(@argument)|(@extends)|(\\{@link))(\\b)/g;\njush.tr.sql = { one: /-- |#|--(?=\\n|\$)/, com_code: /\\/\\*![0-9]*|\\*\\//, com: /\\/\\*/, sql_sqlset: /(\\s*)(SET)(\\s+|\$)(?!NAMES\\b|CHARACTER\\b|PASSWORD\\b|(?:GLOBAL\\s+|SESSION\\s+)?TRANSACTION\\b|@[^@]|NEW\\.|OLD\\.)/i, sql_code: /()/ };\njush.tr.sql_code = { sql_apo: /'/, sql_quo: /\"/, bac: /`/, one: /-- |#|--(?=\\n|\$)/, com_code: /\\/\\*![0-9]*|\\*\\//, com: /\\/\\*/, sql_var: /\\B@/, num: jush.num, _1: /;|\\b(THEN|ELSE|LOOP|REPEAT|DO)\\b/i };\njush.tr.sql_sqlset = { one: /-- |#|--(?=\\n|\$)/, com: /\\/\\*/, sqlset_val: /=/, _1: /;|\$/ };\njush.tr.sqlset_val = { sql_apo: /'/, sql_quo: /\"/, bac: /`/, one: /-- |#|--(?=\\n|\$)/, com: /\\/\\*/, _1: /,/, _2: /;|\$/, num: jush.num }; //! comma can be inside function call\njush.tr.sqlset = { _0: /\$/ }; //! jump from SHOW VARIABLES LIKE ''\njush.tr.sqlstatus = { _0: /\$/ }; //! jump from SHOW STATUS LIKE ''\njush.tr.com_code = { _1: /()/ };\n\njush.urls.sql_sqlset = 'https://dev.mysql.com/doc/mysql/en/\$key';\njush.urls.sql = ['https://dev.mysql.com/doc/mysql/en/\$key',\n\t'alter-event.html', 'alter-table.html', 'alter-view.html', 'analyze-table.html', 'create-event.html', 'create-function.html', 'create-procedure.html', 'create-index.html', 'create-table.html', 'create-trigger.html', 'create-view.html', 'drop-index.html', 'drop-table.html', 'begin-end.html', 'optimize-table.html', 'repair-table.html', 'set-transaction.html', 'show-columns.html', 'show-engines.html', 'show-index.html', 'show-processlist.html', 'show-status.html', 'show-tables.html', 'show-variables.html',\n\t'\$1.html', '\$1-statement.html', 'if-statement.html', 'repeat-statement.html', 'truncate-table.html', 'commit.html', 'savepoints.html', 'lock-tables.html', 'charset-connection.html', 'insert-on-duplicate.html', 'fulltext-search.html', 'example-auto-increment.html',\n\t'comparison-operators.html#operator_\$1', 'comparison-operators.html#function_\$1', 'any-in-some-subqueries.html', 'all-subqueries.html', 'exists-and-not-exists-subqueries.html', 'group-by-modifiers.html', 'string-functions.html#operator_\$1', 'string-comparison-functions.html#operator_\$1', 'regexp.html#operator_\$1', 'regexp.html#operator_regexp', 'logical-operators.html#operator_\$1', 'control-flow-functions.html#operator_\$1', 'arithmetic-functions.html#operator_\$1', 'cast-functions.html#operator_\$1', 'date-and-time-functions.html#function_\$1', 'date-and-time-functions.html#function_date-add',\n\t'', // keywords without link\n\t'numeric-type-syntax.html', 'date-and-time-type-syntax.html', 'string-type-syntax.html', 'mysql-spatial-datatypes.html',\n\t'mathematical-functions.html#function_\$1', 'information-functions.html#function_\$1',\n\t'\$1-storage-engine.html', 'merge-storage-engine.html',\n\t'partitioning-range.html', 'partitioning-list.html', 'partitioning-columns.html', 'partitioning-hash.html', 'partitioning-linear-hash.html', 'partitioning-key.html',\n\t'comparison-operators.html#function_\$1', 'control-flow-functions.html#function_\$1', 'string-functions.html#function_\$1', 'string-comparison-functions.html#function_\$1', 'mathematical-functions.html#function_\$1', 'date-and-time-functions.html#function_\$1', 'cast-functions.html#function_\$1', 'xml-functions.html#function_\$1', 'bit-functions.html#function_\$1', 'encryption-functions.html#function_\$1', 'information-functions.html#function_\$1', 'miscellaneous-functions.html#function_\$1', 'group-by-functions.html#function_\$1',\n\t'functions-to-convert-geometries-between-formats.html#function_asbinary',\n\t'functions-to-convert-geometries-between-formats.html#function_astext',\n\t'functions-for-testing-spatial-relations-between-geometric-objects.html#function_\$1',\n\t'functions-that-create-new-geometries-from-existing-ones.html#function_\$1',\n\t'geometry-property-functions.html#function_\$1',\n\t'gis-wkt-functions.html#function_st-\$1',\n\t'row-subqueries.html',\n\t'fulltext-search.html#function_match'\n];\njush.urls.sqlset = ['https://dev.mysql.com/doc/mysql/en/\$key',\n\t'innodb-parameters.html#sysvar_\$1',\n\t'mysql-cluster-program-options-mysqld.html#option_mysqld_\$1', 'mysql-cluster-replication-conflict-resolution.html#option_mysqld_\$1', 'mysql-cluster-replication-schema.html', 'mysql-cluster-replication-starting.html', 'mysql-cluster-system-variables.html#sysvar_\$1',\n\t'replication-options-binary-log.html#option_mysqld_\$1', 'replication-options-binary-log.html#sysvar_\$1', 'replication-options-master.html#sysvar_\$1', 'replication-options-slave.html#option_mysqld_log-slave-updates', 'replication-options-slave.html#option_mysqld_\$1', 'replication-options-slave.html#sysvar_\$1', 'replication-options.html#option_mysqld_\$1',\n\t'server-options.html#option_mysqld_big-tables', 'server-options.html#option_mysqld_\$1',\n\t'server-system-variables.html#sysvar_\$1', // previously server-session-variables\n\t'server-system-variables.html#sysvar_low_priority_updates', 'server-system-variables.html#sysvar_max_join_size', 'server-system-variables.html#sysvar_\$1',\n\t'ssl-options.html#option_general_\$1'\n];\njush.urls.sqlstatus = ['https://dev.mysql.com/doc/mysql/en/\$key',\n\t'server-status-variables.html#statvar_Com_xxx',\n\t'server-status-variables.html#statvar_\$1'\n];\n\njush.links.sql_sqlset = { 'set-statement.html': /.+/ };\n\njush.links2.sql = /(\\b)(ALTER(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+EVENT|(ALTER(?:\\s+ONLINE|\\s+OFFLINE)?(?:\\s+IGNORE)?\\s+TABLE)|(ALTER(?:\\s+ALGORITHM\\s*=\\s*(?:UNDEFINED|MERGE|TEMPTABLE))?(?:\\s+DEFINER\\s*=\\s*\\S+)?(?:\\s+SQL\\s+SECURITY\\s+(?:DEFINER|INVOKER))?\\s+VIEW)|(ANALYZE(?:\\s+NO_WRITE_TO_BINLOG|\\s+LOCAL)?\\s+TABLE)|(CREATE(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+EVENT)|(CREATE(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+FUNCTION)|(CREATE(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+PROCEDURE)|(CREATE(?:\\s+ONLINE|\\s+OFFLINE)?(?:\\s+UNIQUE|\\s+FULLTEXT|\\s+SPATIAL)?\\s+INDEX)|(CREATE(?:\\s+TEMPORARY)?\\s+TABLE)|(CREATE(?:\\s+DEFINER\\s*=\\s*\\S+)?\\s+TRIGGER)|(CREATE(?:\\s+OR\\s+REPLACE)?(?:\\s+ALGORITHM\\s*=\\s*(?:UNDEFINED|MERGE|TEMPTABLE))?(?:\\s+DEFINER\\s*=\\s*\\S+)?(?:\\s+SQL\\s+SECURITY\\s+(?:DEFINER|INVOKER))?\\s+VIEW)|(DROP(?:\\s+ONLINE|\\s+OFFLINE)?\\s+INDEX)|(DROP(?:\\s+TEMPORARY)?\\s+TABLE)|(END)|(OPTIMIZE(?:\\s+NO_WRITE_TO_BINLOG|\\s+LOCAL)?\\s+TABLE)|(REPAIR(?:\\s+NO_WRITE_TO_BINLOG|\\s+LOCAL)?\\s+TABLE)|(SET(?:\\s+GLOBAL|\\s+SESSION)?\\s+TRANSACTION\\s+ISOLATION\\s+LEVEL)|(SHOW(?:\\s+FULL)?\\s+COLUMNS)|(SHOW(?:\\s+STORAGE)?\\s+ENGINES)|(SHOW\\s+(?:INDEX|INDEXES|KEYS))|(SHOW(?:\\s+FULL)?\\s+PROCESSLIST)|(SHOW(?:\\s+GLOBAL|\\s+SESSION)?\\s+STATUS)|(SHOW(?:\\s+FULL)?\\s+TABLES)|(SHOW(?:\\s+GLOBAL|\\s+SESSION)?\\s+VARIABLES)|(ALTER\\s+(?:DATABASE|SCHEMA)|ALTER\\s+LOGFILE\\s+GROUP|ALTER\\s+SERVER|ALTER\\s+TABLESPACE|BACKUP\\s+TABLE|CACHE\\s+INDEX|CALL|CHANGE\\s+MASTER\\s+TO|CHECK\\s+TABLE|CHECKSUM\\s+TABLE|CREATE\\s+(?:DATABASE|SCHEMA)|CREATE\\s+LOGFILE\\s+GROUP|CREATE\\s+SERVER|CREATE\\s+TABLESPACE|CREATE\\s+USER|DELETE|DESCRIBE|DO|DROP\\s+(?:DATABASE|SCHEMA)|DROP\\s+EVENT|DROP\\s+FUNCTION|DROP\\s+PROCEDURE|DROP\\s+LOGFILE\\s+GROUP|DROP\\s+SERVER|DROP\\s+TABLESPACE|DROP\\s+TRIGGER|DROP\\s+USER|DROP\\s+VIEW|EXPLAIN|FLUSH|GRANT|HANDLER|HELP|INSERT|INSTALL\\s+PLUGIN|JOIN|KILL|LOAD\\s+DATA\\s+FROM\\s+MASTER|LOAD\\s+DATA|LOAD\\s+INDEX|LOAD\\s+XML|PURGE\\s+MASTER\\s+LOGS|RENAME\\s+(?:DATABASE|SCHEMA)|RENAME\\s+TABLE|RENAME\\s+USER|REPLACE|RESET\\s+MASTER|RESET\\s+SLAVE|RESIGNAL|RESTORE\\s+TABLE|REVOKE|SELECT|SET\\s+PASSWORD|SHOW\\s+AUTHORS|SHOW\\s+BINARY\\s+LOGS|SHOW\\s+BINLOG\\s+EVENTS|SHOW\\s+CHARACTER\\s+SET|SHOW\\s+COLLATION|SHOW\\s+CONTRIBUTORS|SHOW\\s+CREATE\\s+(?:DATABASE|SCHEMA)|SHOW\\s+CREATE\\s+TABLE|SHOW\\s+CREATE\\s+VIEW|SHOW\\s+(?:DATABASE|SCHEMA)S|SHOW\\s+ENGINE|SHOW\\s+ERRORS|SHOW\\s+GRANTS|SHOW\\s+MASTER\\s+STATUS|SHOW\\s+OPEN\\s+TABLES|SHOW\\s+PLUGINS|SHOW\\s+PRIVILEGES|SHOW\\s+SCHEDULER\\s+STATUS|SHOW\\s+SLAVE\\s+HOSTS|SHOW\\s+SLAVE\\s+STATUS|SHOW\\s+TABLE\\s+STATUS|SHOW\\s+TRIGGERS|SHOW\\s+WARNINGS|SHOW|SIGNAL|START\\s+SLAVE|STOP\\s+SLAVE|UNINSTALL\\s+PLUGIN|UNION|UPDATE|USE)|(LOOP|LEAVE|ITERATE|WHILE)|(IF|ELSEIF)|(REPEAT|UNTIL)|(TRUNCATE(?:\\s+TABLE)?)|(START\\s+TRANSACTION|BEGIN|COMMIT|ROLLBACK)|(SAVEPOINT|ROLLBACK\\s+TO\\s+SAVEPOINT)|((?:UN)?LOCK\\s+TABLES?)|(SET\\s+NAMES|SET\\s+CHARACTER\\s+SET)|(ON\\s+DUPLICATE\\s+KEY\\s+UPDATE)|(IN\\s+BOOLEAN\\s+MODE|IN\\s+NATURAL\\s+LANGUAGE\\s+MODE|WITH\\s+QUERY\\s+EXPANSION)|(AUTO_INCREMENT)|(IS|IS\\s+NULL)|(BETWEEN|NOT\\s+BETWEEN|IN|NOT\\s+IN)|(ANY|SOME)|(ALL)|(EXISTS|NOT\\s+EXISTS)|(WITH\\s+ROLLUP)|(SOUNDS\\s+LIKE)|(LIKE|NOT\\s+LIKE)|(NOT\\s+REGEXP|REGEXP)|(RLIKE)|(NOT|AND|OR|XOR)|(CASE)|(DIV)|(BINARY)|(CURRENT_DATE|CURRENT_TIME|CURRENT_TIMESTAMP|LOCALTIME|LOCALTIMESTAMP|UTC_DATE|UTC_TIME|UTC_TIMESTAMP)|(INTERVAL)|(ACCESSIBLE|ADD|ALTER|ANALYZE|AS|ASC|ASENSITIVE|BEFORE|BOTH|BY|CASCADE|CHANGE|CHARACTER|CHECK|CLOSE|COLLATE|COLUMN|CONDITION|CONSTRAINT|CONTINUE|CONVERT|CREATE|CROSS|CURSOR|DATABASE|DATABASES|DAY_HOUR|DAY_MICROSECOND|DAY_MINUTE|DAY_SECOND|DECLARE|DEFAULT|DELAYED|DESC|DETERMINISTIC|DISTINCT|DISTINCTROW|DROP|DUAL|EACH|ELSE|ENCLOSED|ESCAPED|EXIT|FALSE|FETCH|FLOAT4|FLOAT8|FOR|FORCE|FOREIGN|FROM|FULLTEXT|GROUP|HAVING|HIGH_PRIORITY|HOUR_MICROSECOND|HOUR_MINUTE|HOUR_SECOND|IGNORE|INDEX|INFILE|INNER|INOUT|INSENSITIVE|INT1|INT2|INT3|INT4|INT8|INTO|KEY|KEYS|LEADING|LEFT|LIMIT|LINEAR|LINES|LOAD|LOCK|LONG|LOW_PRIORITY|MASTER_SSL_VERIFY_SERVER_CERT|MATCH|MIDDLEINT|MINUTE_MICROSECOND|MINUTE_SECOND|MODIFIES|NATURAL|NO_WRITE_TO_BINLOG|NULL|OFFSET|ON|OPEN|OPTIMIZE|OPTION|OPTIONALLY|ORDER|OUT|OUTER|OUTFILE|PRECISION|PRIMARY|PROCEDURE|PURGE|RANGE|READ|READS|READ_WRITE|REFERENCES|RELEASE|RENAME|REQUIRE|RESTRICT|RETURN|RIGHT|SCHEMA|SCHEMAS|SECOND_MICROSECOND|SENSITIVE|SEPARATOR|SPATIAL|SPECIFIC|SQL|SQLEXCEPTION|SQLSTATE|SQLWARNING|SQL_BIG_RESULT|SQL_CALC_FOUND_ROWS|SQL_SMALL_RESULT|SSL|STARTING|STRAIGHT_JOIN|TABLE|TERMINATED|THEN|TO|TRAILING|TRIGGER|TRUE|UNDO|UNIQUE|UNLOCK|UNSIGNED|USAGE|USING|VALUES|VARCHARACTER|VARYING|WHEN|WHERE|WITH|WRITE|XOR|YEAR_MONTH|ZEROFILL))\\b(?!\\()|\\b(bit|tinyint|bool|boolean|smallint|mediumint|int|integer|bigint|float|double\\s+precision|double|real|decimal|dec|numeric|fixed|(date|datetime|timestamp|time|year)|(char|varchar|binary|varbinary|tinyblob|tinytext|blob|text|mediumblob|mediumtext|longblob|longtext|enum|set)|(geometry|point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection)|(mod)|(CURRENT_USER)|(InnoDB|MyISAM|MEMORY|CSV|ARCHIVE|BLACKHOLE|MERGE|FEDERATED)|(MRG_MyISAM)|(PARTITION\\s+BY\\s+RANGE)|(PARTITION\\s+BY\\s+LIST)|(PARTITION\\s+BY\\s+COLUMNS)|(PARTITION\\s+BY\\s+HASH)|(PARTITION\\s+BY\\s+LINEAR\\s+HASH)|(PARTITION\\s+BY(?:\\s+LINEAR)?\\s+KEY))\\b|\\b(coalesce|greatest|isnull|interval|least|(if|ifnull|nullif)|(ascii|bin|bit_length|char|char_length|character_length|concat|concat_ws|conv|elt|export_set|field|find_in_set|format|hex|insert|instr|lcase|left|length|load_file|locate|lower|lpad|ltrim|make_set|mid|oct|octet_length|ord|position|quote|repeat|replace|reverse|right|rpad|rtrim|soundex|sounds_like|space|substr|substring|substring_index|trim|ucase|unhex|upper)|(strcmp)|(abs|acos|asin|atan|atan2|ceil|ceiling|cos|cot|crc32|degrees|exp|floor|ln|log|log2|log10|pi|pow|power|radians|rand|round|sign|sin|sqrt|tan|truncate)|(adddate|addtime|convert_tz|curdate|curtime|date|datediff|date_add|date_format|date_sub|day|dayname|dayofmonth|dayofweek|dayofyear|extract|from_days|from_unixtime|get_format|hour|last_day|makedate|maketime|microsecond|minute|month|monthname|now|period_add|period_diff|quarter|second|sec_to_time|str_to_date|subdate|subtime|sysdate|time|timediff|timestamp|timestampadd|timestampdiff|time_format|time_to_sec|to_days|to_seconds|unix_timestamp|week|weekday|weekofyear|year|yearweek)|(cast|convert)|(extractvalue|updatexml)|(bit_count)|(aes_encrypt|aes_decrypt|compress|decode|encode|des_decrypt|des_encrypt|encrypt|md5|old_password|password|sha|sha1|uncompress|uncompressed_length)|(benchmark|charset|coercibility|collation|connection_id|database|found_rows|last_insert_id|row_count|schema|session_user|system_user|user|version)|(default|get_lock|inet_aton|inet_ntoa|is_free_lock|is_used_lock|master_pos_wait|name_const|release_lock|sleep|uuid|uuid_short|values)|(avg|bit_and|bit_or|bit_xor|count|count_distinct|group_concat|min|max|std|stddev|stddev_pop|stddev_samp|sum|var_pop|var_samp|variance)|(asbinary|aswkb)|(astext|aswkt)|(mbrcontains|mbrdisjoint|mbrequal|mbrintersects|mbroverlaps|mbrtouches|mbrwithin|contains|crosses|disjoint|equals|intersects|overlaps|touches|within)|(buffer|convexhull|difference|intersection|symdifference)|(dimension|envelope|geometrytype|srid|boundary|isempty|issimple|x|y|endpoint|glength|numpoints|pointn|startpoint|isring|isclosed|area|exteriorring|interiorringn|numinteriorrings|centroid|geometryn|numgeometries)|(geomcollfromtext|geomfromtext|linefromtext|mlinefromtext|mpointfromtext|mpolyfromtext|pointfromtext|polyfromtext|bdmpolyfromtext|bdpolyfromtext|geomcollfromwkb|geomfromwkb|linefromwkb|mlinefromwkb|mpointfromwkb|mpolyfromwkb|pointfromwkb|polyfromwkb|bdmpolyfromwkb|bdpolyfromwkb|geometrycollection|linestring|multilinestring|multipoint|multipolygon|point|polygon)|(row)|(match|against))(\\s*\\(|\$)/gi; // collisions: char, set, union(), allow parenthesis - IN, ANY, ALL, SOME, NOT, AND, OR, XOR\njush.links2.sqlset = /(\\b)(ignore_builtin_innodb|innodb_adaptive_hash_index|innodb_additional_mem_pool_size|innodb_autoextend_increment|innodb_autoinc_lock_mode|innodb_buffer_pool_awe_mem_mb|innodb_buffer_pool_size|innodb_commit_concurrency|innodb_concurrency_tickets|innodb_data_file_path|innodb_data_home_dir|innodb_doublewrite|innodb_fast_shutdown|innodb_file_io_threads|innodb_file_per_table|innodb_flush_log_at_trx_commit|innodb_flush_method|innodb_force_recovery|innodb_checksums|innodb_lock_wait_timeout|innodb_locks_unsafe_for_binlog|innodb_log_arch_dir|innodb_log_archive|innodb_log_buffer_size|innodb_log_file_size|innodb_log_files_in_group|innodb_log_group_home_dir|innodb_max_dirty_pages_pct|innodb_max_purge_lag|innodb_mirrored_log_groups|innodb_open_files|innodb_rollback_on_timeout|innodb_stats_on_metadata|innodb_support_xa|innodb_sync_spin_loops|innodb_table_locks|innodb_thread_concurrency|innodb_thread_sleep_delay|innodb_use_legacy_cardinality_algorithm|(ndb[-_]batch[-_]size)|(ndb[-_]log[-_]update[-_]as[-_]write|ndb_log_updated_only)|(ndb_log_orig)|(slave[-_]allow[-_]batching)|(have_ndbcluster|multi_range_count|ndb_autoincrement_prefetch_sz|ndb_cache_check_time|ndb_extra_logging|ndb_force_send|ndb_use_copying_alter_table|ndb_use_exact_count|ndb_wait_connected)|(log[-_]bin[-_]trust[-_]function[-_]creators|log[-_]bin)|(binlog_cache_size|max_binlog_cache_size|max_binlog_size|sync_binlog)|(auto_increment_increment|auto_increment_offset)|(ndb_log_empty_epochs)|(log[-_]slave[-_]updates|report[-_]host|report[-_]password|report[-_]port|report[-_]user|slave[-_]net[-_]timeout|slave[-_]skip[-_]errors)|(init_slave|rpl_recovery_rank|slave_compressed_protocol|slave_exec_mode|slave_transaction_retries|sql_slave_skip_counter)|(master[-_]bind|slave[-_]load[-_]tmpdir|server[-_]id)|(sql_big_tables)|(basedir|big[-_]tables|binlog[-_]format|collation[-_]server|datadir|debug|delay[-_]key[-_]write|engine[-_]condition[-_]pushdown|event[-_]scheduler|general[-_]log|character[-_]set[-_]filesystem|character[-_]set[-_]server|character[-_]sets[-_]dir|init[-_]file|language|large[-_]pages|log[-_]error|log[-_]output|log[-_]queries[-_]not[-_]using[-_]indexes|log[-_]slow[-_]queries|log[-_]warnings|log|low[-_]priority[-_]updates|memlock|min[-_]examined[-_]row[-_]limit|old[-_]passwords|open[-_]files[-_]limit|pid[-_]file|port|safe[-_]show[-_]database|secure[-_]auth|secure[-_]file[-_]priv|skip[-_]external[-_]locking|skip[-_]networking|skip[-_]show[-_]database|slow[-_]query[-_]log|socket|sql[-_]mode|tmpdir|version)|(autocommit|error_count|foreign_key_checks|identity|insert_id|last_insert_id|profiling|profiling_history_size|rand_seed1|rand_seed2|sql_auto_is_null|sql_big_selects|sql_buffer_result|sql_log_bin|sql_log_off|sql_log_update|sql_notes|sql_quote_show_create|sql_safe_updates|sql_warnings|timestamp|unique_checks|warning_count)|(sql_low_priority_updates)|(sql_max_join_size)|(automatic_sp_privileges|back_log|bulk_insert_buffer_size|collation_connection|collation_database|completion_type|concurrent_insert|connect_timeout|date_format|datetime_format|default_week_format|delayed_insert_limit|delayed_insert_timeout|delayed_queue_size|div_precision_increment|expire_logs_days|flush|flush_time|ft_boolean_syntax|ft_max_word_len|ft_min_word_len|ft_query_expansion_limit|ft_stopword_file|general_log_file|group_concat_max_len|have_archive|have_blackhole_engine|have_compress|have_crypt|have_csv|have_dynamic_loading|have_example_engine|have_federated_engine|have_geometry|have_innodb|have_isam|have_merge_engine|have_openssl|have_partitioning|have_query_cache|have_raid|have_row_based_replication|have_rtree_keys|have_ssl|have_symlink|hostname|character_set_client|character_set_connection|character_set_database|character_set_results|character_set_system|init_connect|interactive_timeout|join_buffer_size|keep_files_on_create|key_buffer_size|key_cache_age_threshold|key_cache_block_size|key_cache_division_limit|large_page_size|lc_time_names|license|local_infile|locked_in_memory|log_bin|long_query_time|lower_case_file_system|lower_case_table_names|max_allowed_packet|max_connect_errors|max_connections|max_delayed_threads|max_error_count|max_heap_table_size|max_insert_delayed_threads|max_join_size|max_length_for_sort_data|max_prepared_stmt_count|max_relay_log_size|max_seeks_for_key|max_sort_length|max_sp_recursion_depth|max_tmp_tables|max_user_connections|max_write_lock_count|myisam_data_pointer_size|myisam_max_sort_file_size|myisam_recover_options|myisam_repair_threads|myisam_sort_buffer_size|myisam_stats_method|myisam_use_mmap|named_pipe|net_buffer_length|net_read_timeout|net_retry_count|net_write_timeout|new|old|optimizer_prune_level|optimizer_search_depth|optimizer_switch|plugin_dir|preload_buffer_size|prepared_stmt_count|protocol_version|pseudo_thread_id|query_alloc_block_size|query_cache_limit|query_cache_min_res_unit|query_cache_size|query_cache_type|query_cache_wlock_invalidate|query_prealloc_size|range_alloc_block_size|read_buffer_size|read_only|read_rnd_buffer_size|relay_log_purge|relay_log_space_limit|shared_memory|shared_memory_base_name|slow_launch_time|slow_query_log_file|sort_buffer_size|sql_select_limit|storage_engine|sync_frm|system_time_zone|table_cache|table_definition_cache|table_lock_wait_timeout|table_open_cache|table_type|thread_cache_size|thread_concurrency|thread_handling|thread_stack|time_format|time_zone|timed_mutexes|tmp_table_size|transaction_alloc_block_size|transaction_prealloc_size|tx_isolation|updatable_views_with_limit|version_comment|version_compile_machine|version_compile_os|wait_timeout)|(ssl[-_]ca|ssl[-_]capath|ssl[-_]cert|ssl[-_]cipher|ssl[-_]key))((?!-)\\b)/gi;\njush.links2.sqlstatus = /()(Com_.+|(.+))()/gi;\n";
 } elseif ($_GET["file"] == "logo.png") {
 	header("Content-Type: image/png");
 	echo "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x009\x00\x00\x009\x04\x03\x00\x00\x00~6\x9e\xb6\x00\x00\x000PLTE\x00\x00\x00\x83\x97\xad+NvYt\x93s\x89\xa3\x9e\xae\xbe\xb4\xbe\xcc\xc8\xd2\xda\xfc\x8d\x91\xfcsu\xfcIJ\xf7\xd3\xd4\xfc/.\xfc\x06\x07\xfc\xaf\xb1\xfa\xfc\xfaC\x04\xa5\xd7\x00\x00\x00\x01tRNS\x00@\xe6\xd8f\x00\x00\x00\tpHYs\x00\x00\x0b\x13\x00\x00\x0b\x13\x01\x00\x9a\x9c\x18\x00\x00\x01\xb4IDAT8\x8d\xd5\x94\xcdN\xc2@\x10\xc7\xfb\x06\x1bE\xe1\xecl\x13\xcf\xb6\xf5\x01\xa4p6\x1a\x88G.\$=\x12\xa3\xa5\xc7>\x81\xe1\t\x0cw5r\x16\x0f}\x82z7\xb2>\x80\x91P\x13\xe5#\$\x8c\xb3K\xa1j\xab7\x8d\xfc\x0f\xdd\xb6\xbf\xcc\xce\xcc\x7f?4m\x95\x84\x88\xd1\xf7t&\xee~\xc03!\x1e0\x930\x8a\x9a^\x84\xbdAf0\xde\"\xe5\xbd\x11\xed,\xca\xf0*\xa0\xe74\xbc\x8c\xe2o\xa5E\xe8\xb3\x08\xe8\xd7X(*Y\xd3\xf3\xbc\xb8\t6\t\xefPcOW\xa2\x15\xc9\xce\xdc\x8am\x92\xacr\x830\xc3~/\xa0\xe1L\xa8\x01\rXj\x0b#\xd6\x15m\xca\xc1\xfaj\xc0C\x80]G\xa6m\xe6\x00\xb6}\x16\xde\xcb\x04\xac\xdf\x91u\xbcA9\xc0X\xa3\n\xd4\xd88\xbcV\xb1\x1dY\xc4+\xc7D#\xa8iq\xdenKQ8J\xe01Q6\x11\xb2\xe6Y0\xa7`\x95\x1d\x9fP\xb3b\x02Q\x8d\\\x1ah\x94~>\xf3:pS\xc9\x80\x1d\xa3\xa6\xbc\xa2\xd8\xf3GE\xf5Q=\xeeI\xcf{\x92*\x9f\x173\xeb2\xa37\xf7\n\x15e\xca\x14L\xe8B\x8a~\xd0/R(\$\xb0\x0e)\xca\xe7\x8b \x97\xc1HQn\x80i\x956\x0fJ\xb6\t<\x9d\xd7-.\x96w\xc7\xc9\xaaj\xeaVm\xab\xea\xfcm\xbf?S\xdeH\xa0\x9bv\xc3\xcc\xfb\xf1\xc6\xa9\xa7\xdd\x00\xe0\xd6^\xd5q\xab\x1b\xb6\x01)\xaa\x0f\x97\xdb]\xf7\x8b\x19U\xb992\xd1,;\xff\xc7\x8d\x17\xee'p\xf8\xb5\xa3!X\xcb\x83\xe4\xda\xdc\xffL\xf1D.\xbbt\xc3\xa6\x97\xfd/w\x14\xc3\xd3\xe4\xec\x17R\xf7\x1b\x9d\tw\xadd\xd3\xd6r2\xef\xc6\xa4\xaa4[=\xbd\x03E5\xf7S+\xf1\x97c\x00\x00\x00\x00IEND\xaeB`\x82";
 }
 exit;
 
-}
-
-if ($_GET["script"] == "version") {
-	$filename = get_temp_dir() . "/adminer.version";
-	@unlink($filename); // it may not be writable by us, @ - it may not exist
-	$fp = file_open_lock($filename);
-	if ($fp) {
-		file_write_unlock($fp, serialize(array("signature" => $_POST["signature"], "version" => $_POST["version"])));
-	}
-	exit;
 }
 
 // Adminer doesn't use any global variables; they used to be declared here
@@ -1497,7 +1507,11 @@ if (!defined("SID")) {
 }
 
 // disable magic quotes to be able to use database escaping function
-remove_slashes(array(&$_GET, &$_POST, &$_COOKIE), $filter);
+if (function_exists("get_magic_quotes_gpc") && get_magic_quotes_gpc()) {
+	$_GET = remove_slashes($_GET, $filter);
+	$_POST = remove_slashes($_POST, $filter);
+	$_COOKIE = remove_slashes($_COOKIE, $filter);
+}
 if (function_exists("get_magic_quotes_runtime") && get_magic_quotes_runtime()) {
 	set_magic_quotes_runtime(false);
 }
@@ -1685,6 +1699,7 @@ function get_translations($lang) {
   'Unknown error.',
   'System',
   'Server',
+  'hostname[:port] or :socket',
   'Username',
   'Password',
   'Database',
@@ -1693,8 +1708,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Select data',
   'Show structure',
-  'Alter table',
   'Alter view',
+  'Alter table',
   'New item',
   'Warnings',
   [
@@ -1999,6 +2014,7 @@ function get_translations($lang) {
   'Unknown error.',
   'النظام',
   'الخادم',
+  'hostname[:port] or :socket',
   'اسم المستخدم',
   'كلمة المرور',
   'قاعدة بيانات',
@@ -2007,8 +2023,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'عرض البيانات',
   'عرض التركيبة',
-  'تعديل الجدول',
   'تعديل عرض',
+  'تعديل الجدول',
   'عنصر جديد',
   'Warnings',
   '%d بايت',
@@ -2290,6 +2306,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Система',
   'Сървър',
+  'hostname[:port] or :socket',
   'Потребител',
   'Парола',
   'База данни',
@@ -2298,8 +2315,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Показване на данни',
   'Структура',
-  'Промяна на таблица',
   'Промяна на изглед',
+  'Промяна на таблица',
   'Нов елемент',
   'Warnings',
   [
@@ -2605,6 +2622,7 @@ function get_translations($lang) {
   'অজানা ত্রুটি।',
   'সিস্টেম',
   'সার্ভার',
+  'hostname[:port] or :socket',
   'ইউজারের নাম',
   'পাসওয়ার্ড',
   'ডাটাবেজ',
@@ -2613,8 +2631,8 @@ function get_translations($lang) {
   'Adminer পাসওয়ার্ড ছাড়া ডাটাবেস অ্যাক্সেস সমর্থন করে না, <a href="https://www.adminer.org/en/password/"%s>আরও তথ্য</a>।',
   'তথ্য নির্বাচন করো',
   'গঠন দেখান',
-  'টেবিল পরিবর্তন করুন',
   'ভিউ পরিবর্তন করুন',
+  'টেবিল পরিবর্তন করুন',
   'নতুন বিষয়বস্তু',
   'সতর্কতা',
   [
@@ -2918,6 +2936,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistem',
   'Server',
+  'hostname[:port] or :socket',
   'Korisničko ime',
   'Lozinka',
   'Baza podataka',
@@ -2926,8 +2945,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Izaberi podatke',
   'Prikaži strukturu',
-  'Ažuriraj tabelu',
   'Ažuriraj pogled',
+  'Ažuriraj tabelu',
   'Nova stavka',
   'Warnings',
   [
@@ -3238,6 +3257,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistema',
   'Servidor',
+  'hostname[:port] or :socket',
   'Nom d\'usuari',
   'Contrasenya',
   'Base de dades',
@@ -3246,8 +3266,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Selecciona dades',
   'Mostra l\'estructura',
-  'Modifica la taula',
   'Modifica la vista',
+  'Modifica la taula',
   'Nou element',
   'Warnings',
   [
@@ -3550,6 +3570,7 @@ function get_translations($lang) {
   'Neznámá chyba.',
   'Systém',
   'Server',
+  'hostname[:port] nebo :socket',
   'Uživatel',
   'Heslo',
   'Databáze',
@@ -3558,8 +3579,8 @@ function get_translations($lang) {
   'Adminer nepodporuje přístup k databázi bez hesla, <a href="https://www.adminer.org/cs/password/"%s>více informací</a>.',
   'Vypsat data',
   'Zobrazit strukturu',
-  'Pozměnit tabulku',
   'Pozměnit pohled',
+  'Pozměnit tabulku',
   'Nová položka',
   'Varování',
   [
@@ -3874,6 +3895,7 @@ function get_translations($lang) {
   'Unknown error.',
   'System',
   'Server',
+  'hostname[:port] or :socket',
   'Brugernavn',
   'Kodeord',
   'Database',
@@ -3882,8 +3904,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Vælg data',
   'Vis struktur',
-  'Ændre tabel',
   'Ændre view',
+  'Ændre tabel',
   'Nyt emne',
   'Warnings',
   [
@@ -4186,6 +4208,7 @@ function get_translations($lang) {
   'Unbekannter Fehler.',
   'Datenbank System',
   'Server',
+  'hostname[:port] or :socket',
   'Benutzer',
   'Passwort',
   'Datenbank',
@@ -4194,8 +4217,8 @@ function get_translations($lang) {
   'Adminer unterstützt den Zugriff auf eine Datenbank ohne Passwort nicht, <a href="https://www.adminer.org/de/password/"%s>mehr Informationen</a>.',
   'Daten auswählen',
   'Struktur anzeigen',
-  'Tabelle ändern',
   'View ändern',
+  'Tabelle ändern',
   'Neuer Datensatz',
   'Warnungen',
   [
@@ -4498,6 +4521,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Σύστημα',
   'Διακομιστής',
+  'hostname[:port] or :socket',
   'Όνομα Χρήστη',
   'Κωδικός',
   'Β. Δεδομένων',
@@ -4506,8 +4530,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Επιλέξτε δεδομένα',
   'Προβολή δομής',
-  'Τροποποίηση πίνακα',
   'Τροποποίηση προβολής',
+  'Τροποποίηση πίνακα',
   'Νέα εγγραφή',
   'Warnings',
   [
@@ -4813,6 +4837,7 @@ function get_translations($lang) {
   'Error desconocido.',
   'Motor de base de datos',
   'Servidor',
+  'hostname[:port] or :socket',
   'Usuario',
   'Contraseña',
   'Base de datos',
@@ -4821,8 +4846,8 @@ function get_translations($lang) {
   'Adminer no soporta accesar una base de datos sin clave, <a href="https://www.adminer.org/en/password/"%s>Ver detalles</a>.',
   'Visualizar contenido',
   'Mostrar estructura',
-  'Modificar tabla',
   'Modificar vista',
+  'Modificar tabla',
   'Nuevo Registro',
   'Advertencias',
   [
@@ -5127,6 +5152,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Andmebaasimootor',
   'Server',
+  'hostname[:port] or :socket',
   'Kasutajanimi',
   'Parool',
   'Andmebaas',
@@ -5135,8 +5161,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Vaata andmeid',
   'Näita struktuuri',
-  'Muuda tabeli struktuuri',
   'Muuda vaadet (VIEW)',
+  'Muuda tabeli struktuuri',
   'Lisa kirje',
   'Warnings',
   [
@@ -5424,6 +5450,7 @@ function get_translations($lang) {
   'Unknown error.',
   'سیستم',
   'سرور',
+  'hostname[:port] or :socket',
   'نام کاربری',
   'کلمه عبور',
   'پایگاه داده',
@@ -5432,8 +5459,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'انتخاب داده',
   'نمایش ساختار',
-  'ویرایش جدول',
   'حذف نمایش',
+  'ویرایش جدول',
   'آیتم جدید',
   'Warnings',
   [
@@ -5730,6 +5757,7 @@ function get_translations($lang) {
   'Tuntematon virhe.',
   'Järjestelmä',
   'Palvelin',
+  'hostname[:port] or :socket',
   'Käyttäjänimi',
   'Salasana',
   'Tietokanta',
@@ -5738,8 +5766,8 @@ function get_translations($lang) {
   'Adminer ei tue pääsyä tietokantaan ilman salasanaa, katso tarkemmin <a href="https://www.adminer.org/en/password/"%s>täältä</a>.',
   'Valitse data',
   'Näytä rakenne',
-  'Muuta taulua',
   'Muuta näkymää',
+  'Muuta taulua',
   'Uusi tietue',
   'Varoitukset',
   [
@@ -6045,6 +6073,7 @@ function get_translations($lang) {
   'Erreur inconnue.',
   'Système',
   'Serveur',
+  'hostname[:port] or :socket',
   'Utilisateur',
   'Mot de passe',
   'Base de données',
@@ -6053,8 +6082,8 @@ function get_translations($lang) {
   'Adminer ne supporte pas l\'accès aux bases de données sans mot de passe, <a href="https://www.adminer.org/en/password/"%s>plus d\'information</a>.',
   'Afficher les données',
   'Afficher la structure',
-  'Modifier la table',
   'Modifier une vue',
+  'Modifier la table',
   'Nouvel élément',
   'Avertissements',
   [
@@ -6360,6 +6389,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistema',
   'Servidor',
+  'hostname[:port] or :socket',
   'Usuario',
   'Contrasinal',
   'Base de datos',
@@ -6368,8 +6398,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Seleccionar datos',
   'Amosar estructura',
-  'Modificar táboa',
   'Modificar vista',
+  'Modificar táboa',
   'Novo elemento',
   'Warnings',
   [
@@ -6678,6 +6708,7 @@ function get_translations($lang) {
   'Unknown error.',
   'מערכת',
   'שרת',
+  'hostname[:port] or :socket',
   'שם משתמש',
   'סיסמה',
   'מסד נתונים',
@@ -6686,8 +6717,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'בחר נתונים',
   'הראה מבנה',
-  'שנה טבלה',
   'שנה תצוגה',
+  'שנה טבלה',
   'פריט חדש',
   'Warnings',
   '%d בתים',
@@ -6966,6 +6997,7 @@ function get_translations($lang) {
   'अज्ञात त्रुटि।',
   'सिस्टम',
   'सर्वर',
+  'hostname[:port] or :socket',
   'उपयोगकर्ता नाम',
   'पासवर्ड',
   'डेटाबेस',
@@ -6974,8 +7006,8 @@ function get_translations($lang) {
   'एडमिनर बिना पासवर्ड के डेटाबेस एक्सेस करने का समर्थन नहीं करता, <a href="https://www.adminer.org/en/password/"%s>अधिक जानकारी</a>।',
   'डेटा चुनें',
   'संरचना दिखाएं',
-  'टेबल बदलें',
   'व्यू बदलें',
+  'टेबल बदलें',
   'नया आइटम',
   'चेतावनियाँ',
   [
@@ -7275,6 +7307,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Adatbázis',
   'Szerver',
+  'hostname[:port] or :socket',
   'Felhasználó',
   'Jelszó',
   'Adatbázis',
@@ -7283,8 +7316,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Tartalom',
   'Struktúra',
-  'Tábla módosítása',
   'Nézet módosítása',
+  'Tábla módosítása',
   'Új tétel',
   'Warnings',
   [
@@ -7591,6 +7624,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistem',
   'Server',
+  'hostname[:port] or :socket',
   'Pengguna',
   'Sandi',
   'Basis data',
@@ -7599,8 +7633,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Pilih data',
   'Lihat struktur',
-  'Ubah tabel',
   'Ubah tampilan',
+  'Ubah tabel',
   'Entri baru',
   'Warnings',
   '%d bita',
@@ -7879,6 +7913,7 @@ function get_translations($lang) {
   'Errore sconosciuto.',
   'Sistema',
   'Server',
+  'hostname[:port] or :socket',
   'Utente',
   'Password',
   'Database',
@@ -7887,8 +7922,8 @@ function get_translations($lang) {
   'Adminer non supporta accesso a databse senza password, <a href="https://www.adminer.org/it/password/"%s>piú informazioni</a>.',
   'Visualizza dati',
   'Visualizza struttura',
-  'Modifica tabella',
   'Modifica vista',
+  'Modifica tabella',
   'Nuovo elemento',
   'Attenzione',
   [
@@ -8194,6 +8229,7 @@ function get_translations($lang) {
   '不明なエラーです。',
   'データベース種類',
   'サーバー',
+  'hostname[:port] or :socket',
   'ユーザー名',
   'パスワード',
   'データベース',
@@ -8202,8 +8238,8 @@ function get_translations($lang) {
   'Adminer はパスワードのないデータベースへの接続には対応していません。(<a href="https://www.adminer.org/en/password/"%s>詳細</a>)',
   'データ',
   'スキーマ',
-  'テーブルの設定を変更',
   'ビューを変更',
+  'テーブルの設定を変更',
   '新規レコードを挿入',
   '警告',
   '%d バイト',
@@ -8482,6 +8518,7 @@ function get_translations($lang) {
   'უცნობი შეცდომა.',
   'სისტემა',
   'სერვერი',
+  'hostname[:port] or :socket',
   'მომხმარებელი',
   'პაროლი',
   'ბაზა',
@@ -8490,8 +8527,8 @@ function get_translations($lang) {
   'უპაროლო წვდომა ბაზასთან არაა დაშვებული Adminer-ში, მეტი ინფორმაციისთვის ეწვიეთ <a href="https://www.adminer.org/en/password/"%s>ბმულს</a>.',
   'არჩევა',
   'სტრუქტურის ჩვენება',
-  'ცხრილის შეცვლა',
   'წარმოდგენის შეცვლა',
+  'ცხრილის შეცვლა',
   'ახალი ჩანაწერი',
   'გაფრთხილება',
   '%d ბაიტი',
@@ -8770,6 +8807,7 @@ function get_translations($lang) {
   'Unknown error.',
   '데이터베이스 형식',
   '서버',
+  'hostname[:port] or :socket',
   '사용자이름',
   '비밀번호',
   '데이터베이스',
@@ -8778,8 +8816,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   '데이터를 선택하십시오',
   '구조 표시',
-  '테이블 변경',
   '보기 변경',
+  '테이블 변경',
   '항목 만들기',
   '경고',
   '%d 바이트',
@@ -9058,6 +9096,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistema',
   'Serveris',
+  'hostname[:port] or :socket',
   'Vartotojas',
   'Slaptažodis',
   'Duomenų bazė',
@@ -9066,8 +9105,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Atrinkti duomenis',
   'Rodyti struktūrą',
-  'Redaguoti lentelę',
   'Redaguoti vaizdą',
+  'Redaguoti lentelę',
   'Naujas įrašas',
   'Warnings',
   [
@@ -9378,6 +9417,7 @@ function get_translations($lang) {
   'Nezināma kļūda.',
   'Sistēma',
   'Serveris',
+  'hostname[:port] or :socket',
   'Lietotājs',
   'Parole',
   'Datubāze',
@@ -9386,8 +9426,8 @@ function get_translations($lang) {
   'Adminer neatbalsta pieeju bez paroles, <a href="https://www.adminer.org/en/password/"%s>vairāk informācijas šeit</a>.',
   'Izvēlēties datus',
   'Parādīt struktūru',
-  'Mainīt tabulu',
   'Izmainīt skatu',
+  'Mainīt tabulu',
   'Jauns ieraksts',
   'Brīdinājumi',
   [
@@ -9702,6 +9742,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistem',
   'Pelayan',
+  'hostname[:port] or :socket',
   'Nama pengguna',
   'Kata laluan',
   'Pangkalan data',
@@ -9710,8 +9751,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Pilih data',
   'Paparkan struktur',
-  'Ubah jadual',
   'Ubah paparan',
+  'Ubah jadual',
   'Item baru',
   'Warnings',
   [
@@ -9993,6 +10034,7 @@ function get_translations($lang) {
   'Onbekende fout.',
   'Databasesysteem',
   'Server',
+  'hostname[:port] or :socket',
   'Gebruikersnaam',
   'Wachtwoord',
   'Database',
@@ -10001,8 +10043,8 @@ function get_translations($lang) {
   'Adminer ondersteunt geen toegang tot databases zonder wachtwoord, <a href="https://www.adminer.org/en/password/"%s>meer informatie</a>.',
   'Gegevens selecteren',
   'Toon structuur',
-  'Tabel aanpassen',
   'View aanpassen',
+  'Tabel aanpassen',
   'Nieuw item',
   'Waarschuwingen',
   [
@@ -10308,6 +10350,7 @@ function get_translations($lang) {
   'Unknown error.',
   'System',
   'Server',
+  'hostname[:port] or :socket',
   'Brukernavn',
   'Passord',
   'Database',
@@ -10316,8 +10359,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Velg data',
   'Vis struktur',
-  'Endre tabell',
   'Endre view',
+  'Endre tabell',
   'Ny rad',
   'Warnings',
   [
@@ -10620,6 +10663,7 @@ function get_translations($lang) {
   'Nieznany błąd.',
   'Rodzaj bazy',
   'Serwer',
+  'hostname[:port] or :socket',
   'Użytkownik',
   'Hasło',
   'Baza danych',
@@ -10628,8 +10672,8 @@ function get_translations($lang) {
   'Adminer nie obsługuje dostępu do bazy danych bez hasła, <a href="https://www.adminer.org/pl/password/"%s>więcej informacji</a>.',
   'Pokaż dane',
   'Struktura tabeli',
-  'Zmień tabelę',
   'Zmień perspektywę',
+  'Zmień tabelę',
   'Nowy rekord',
   'Ostrzeżenia',
   [
@@ -10944,6 +10988,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Motor de Base de dados',
   'Servidor',
+  'hostname[:port] or :socket',
   'Nome de utilizador',
   'Senha',
   'Base de dados',
@@ -10952,8 +10997,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Selecionar dados',
   'Mostrar estrutura',
-  'Modificar estrutura',
   'Modificar vista',
+  'Modificar estrutura',
   'Novo Registo',
   'Warnings',
   [
@@ -11256,6 +11301,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistema',
   'Servidor',
+  'hostname[:port] or :socket',
   'Usuário',
   'Senha',
   'Base de dados',
@@ -11264,8 +11310,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Selecionar dados',
   'Mostrar estrutura',
-  'Alterar estrutura',
   'Alterar visão',
+  'Alterar estrutura',
   'Novo Registro',
   'Warnings',
   [
@@ -11568,6 +11614,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistem',
   'Server',
+  'hostname[:port] or :socket',
   'Nume de utilizator',
   'Parola',
   'Baza de date',
@@ -11576,8 +11623,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Selectează',
   'Arată structura',
-  'Modifică tabelul',
   'Modifică reprezentarea',
+  'Modifică tabelul',
   'Înscriere nouă',
   'Warnings',
   [
@@ -11880,6 +11927,7 @@ function get_translations($lang) {
   'Неизвестная ошибка.',
   'Движок',
   'Сервер',
+  'hostname[:port] or :socket',
   'Имя пользователя',
   'Пароль',
   'База данных',
@@ -11888,8 +11936,8 @@ function get_translations($lang) {
   'Adminer не поддерживает доступ к базе данных без пароля, <a href="https://www.adminer.org/en/password/"%s>больше информации</a>.',
   'Выбрать',
   'Показать структуру',
-  'Изменить таблицу',
   'Изменить представление',
+  'Изменить таблицу',
   'Новая запись',
   'Предупреждения',
   [
@@ -12204,6 +12252,7 @@ function get_translations($lang) {
   'Neznáma chyba.',
   'Systém',
   'Server',
+  'hostname[:port] or :socket',
   'Používateľ',
   'Heslo',
   'Databáza',
@@ -12212,8 +12261,8 @@ function get_translations($lang) {
   'Adminer nepodporuje prístup k databáze bez hesla, <a href="https://www.adminer.org/sk/password/"%s>viac informácií</a>.',
   'Vypísať dáta',
   'Zobraziť štruktúru',
-  'Zmeniť tabuľku',
   'Zmeniť pohľad',
+  'Zmeniť tabuľku',
   'Nová položka',
   'Varovania',
   [
@@ -12524,6 +12573,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistem',
   'Strežnik',
+  'hostname[:port] or :socket',
   'Uporabniško ime',
   'Geslo',
   'Baza',
@@ -12532,8 +12582,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Izberi podatke',
   'Pokaži zgradbo',
-  'Spremeni tabelo',
   'Spremeni pogled',
+  'Spremeni tabelo',
   'Nov predmet',
   'Warnings',
   [
@@ -12852,6 +12902,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Систем',
   'Сервер',
+  'hostname[:port] or :socket',
   'Корисничко име',
   'Лозинка',
   'База података',
@@ -12860,8 +12911,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Изабери податке',
   'Прикажи структуру',
-  'Уреди табелу',
   'Уреди поглед',
+  'Уреди табелу',
   'Нова ставка',
   'Warnings',
   [
@@ -13172,6 +13223,7 @@ function get_translations($lang) {
   'Okänt fel.',
   'System',
   'Server',
+  'hostname[:port] or :socket',
   'Användarnamn',
   'Lösenord',
   'Databas',
@@ -13180,8 +13232,8 @@ function get_translations($lang) {
   'Adminer tillåter inte att ansluta till en databas utan lösenord. <a href="https://www.adminer.org/en/password/"%s>Mer information</a>.',
   'Välj data',
   'Visa struktur',
-  'Ändra tabell',
   'Ändra vy',
+  'Ändra tabell',
   'Ny sak',
   'Varningar',
   [
@@ -13487,6 +13539,7 @@ function get_translations($lang) {
   'Unknown error.',
   'சிஸ்ட‌ம் (System)',
   'வ‌ழ‌ங்கி (Server)',
+  'hostname[:port] or :socket',
   'ப‌ய‌னாள‌ர் (User)',
   'க‌ட‌வுச்சொல்',
   'த‌க‌வ‌ல்த‌ள‌ம்',
@@ -13495,8 +13548,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'த‌க‌வ‌லை தேர்வு செய்',
   'க‌ட்ட‌மைப்பை காண்பிக்க‌வும்',
-  'அட்ட‌வ‌ணையை மாற்று',
   'தோற்ற‌த்தை மாற்று',
+  'அட்ட‌வ‌ணையை மாற்று',
   'புதிய‌ உருப்ப‌டி',
   'Warnings',
   [
@@ -13799,6 +13852,7 @@ function get_translations($lang) {
   'Unknown error.',
   'ระบบ',
   'เซอเวอร์',
+  'hostname[:port] or :socket',
   'ชื่อผู้ใช้งาน',
   'รหัสผ่าน',
   'ฐานข้อมูล',
@@ -13807,8 +13861,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'เลือกข้อมูล',
   'แสดงโครงสร้าง',
-  'เปลี่ยนแปลงตารางแล้ว',
   'เปลี่ยนแปลงวิว',
+  'เปลี่ยนแปลงตารางแล้ว',
   'รายการใหม่',
   'Warnings',
   '%d ไบท์',
@@ -14087,6 +14141,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Sistem',
   'Sunucu',
+  'hostname[:port] or :socket',
   'Kullanıcı',
   'Parola',
   'Veri Tabanı',
@@ -14095,8 +14150,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Veri seç',
   'Yapıyı göster',
-  'Tabloyu değiştir',
   'Görünümü değiştir',
+  'Tabloyu değiştir',
   'Yeni kayıt',
   'Uyarılar',
   [
@@ -14402,6 +14457,7 @@ function get_translations($lang) {
   'Невідома помилка.',
   'Система Бази Даних',
   'Сервер',
+  'hostname[:port] or :socket',
   'Користувач',
   'Пароль',
   'База даних',
@@ -14410,8 +14466,8 @@ function get_translations($lang) {
   'Adminer не підтримує доступ до бази даних без пароля, <a href="https://www.adminer.org/en/password/"%s>більше інформації</a>.',
   'Вибрати дані',
   'Показати структуру',
-  'Змінити таблицю',
   'Змінити вигляд',
+  'Змінити таблицю',
   'Новий запис',
   'Попередження',
   [
@@ -14726,6 +14782,7 @@ function get_translations($lang) {
   'Noma\'lum xatolik.',
   'Tizim',
   'Server',
+  'hostname[:port] or :socket',
   'Foydalanuvchi nomi',
   'Parol',
   'Ma\'lumotlar bazasi',
@@ -14734,8 +14791,8 @@ function get_translations($lang) {
   'Adminer parolsiz ma\'lumotlar bazasiga kirishni qo\'llab-quvvatlamaydi, <a href="https://www.adminer.org/en/password/"%s>ko\'proq ma\'lumot</a>.',
   'Ma\'lumotlarni tanlash',
   'Tuzilishni ko\'rsatish',
-  'Jadvalni o\'zgartirish',
   'Ko\'rinishni o\'zgartirish',
+  'Jadvalni o\'zgartirish',
   'Yangi element',
   'Ogohlantirishlar',
   [
@@ -15041,6 +15098,7 @@ function get_translations($lang) {
   'Unknown error.',
   'Hệ thống',
   'Máy chủ',
+  'hostname[:port] or :socket',
   'Tên người dùng',
   'Mật khẩu',
   'Cơ sở dữ liệu',
@@ -15049,8 +15107,8 @@ function get_translations($lang) {
   'Adminer does not support accessing a database without a password, <a href="https://www.adminer.org/en/password/"%s>more information</a>.',
   'Xem dữ liệu',
   'Hiện cấu trúc',
-  'Sửa bảng',
   'Sửa khung nhìn',
+  'Sửa bảng',
   'Thêm',
   'Warnings',
   '%d byte(s)',
@@ -15329,6 +15387,7 @@ function get_translations($lang) {
   '未知错误。',
   '系统',
   '服务器',
+  'hostname[:port] or :socket',
   '用户名',
   '密码',
   '数据库',
@@ -15337,8 +15396,8 @@ function get_translations($lang) {
   'Adminer默认不支持访问没有密码的数据库，<a href="https://www.adminer.org/en/password/"%s>详情见这里</a>。',
   '选择数据',
   '显示结构',
-  '修改表',
   '修改视图',
+  '修改表',
   '新建数据',
   '警告',
   '%d 字节',
@@ -15617,6 +15676,7 @@ function get_translations($lang) {
   '未知錯誤。',
   '資料庫系統',
   '伺服器',
+  'hostname[:port] or :socket',
   '帳號',
   '密碼',
   '資料庫',
@@ -15625,8 +15685,8 @@ function get_translations($lang) {
   'Adminer預設不支援訪問沒有密碼的資料庫，<a href="https://www.adminer.org/en/password/"%s>詳情見這裡</a>。',
   '選擇資料',
   '顯示結構',
-  '修改資料表',
   '修改檢視表',
+  '修改資料表',
   '新增項目',
   '警告',
   '%d byte(s)',
@@ -16056,6 +16116,7 @@ abstract class SqlDriver {
 
 	/** @var Db */ protected $conn;
 	/** @var int[][] */ protected $types = array(); // [$group => [$type => $maximum_unsigned_length, ...], ...]
+	/** @var string */ public $delimiter = ";";
 	/** @var string[] */ public $insertFunctions = array(); // ["$type|$type2" => "$function/$function2"] functions used in edit and insert
 	/** @var string[] */ public $editFunctions = array(); // ["$type|$type2" => "$function/$function2"] functions used in edit only
 	/** @var list<string> */ public $unsigned = array(); // number variants
@@ -16227,7 +16288,7 @@ abstract class SqlDriver {
 	}
 
 	/** Convert value returned by database to actual value
-	* @param Field $field
+	* @param array{type: string} $field
 	*/
 	function value($val, array $field) {
 		return (method_exists($this->conn, 'value') ? $this->conn->value($val, $field) : $val);
@@ -16251,14 +16312,14 @@ abstract class SqlDriver {
 	}
 
 	/** Get tables this table inherits from
-	* @return list<string>
+	* @return list<array{table: string, ns: string}>
 	*/
 	function inheritsFrom($table) {
 		return array();
 	}
 
 	/** Get inherited tables
-	* @return list<string>
+	* @return list<array{table: string, ns: string}>
 	*/
 	function inheritedTables($table) {
 		return array();
@@ -16305,10 +16366,10 @@ abstract class SqlDriver {
 		// MariaDB contains CHECK_CONSTRAINTS.TABLE_NAME, MySQL and PostrgreSQL not
 		return get_key_vals("SELECT c.CONSTRAINT_NAME, CHECK_CLAUSE
 FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS c
-JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS t ON c.CONSTRAINT_SCHEMA = t.CONSTRAINT_SCHEMA AND c.CONSTRAINT_NAME = t.CONSTRAINT_NAME
+JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS t ON c.CONSTRAINT_SCHEMA = t.CONSTRAINT_SCHEMA AND c.CONSTRAINT_NAME = t.CONSTRAINT_NAME" . ($this->conn->flavor == 'maria' ? " AND c.TABLE_NAME = t.TABLE_NAME" : "") . "
 WHERE c.CONSTRAINT_SCHEMA = " . q($_GET["ns"] != "" ? $_GET["ns"] : DB) . "
-AND t.TABLE_NAME = " . q($table) . "
-AND CHECK_CLAUSE NOT LIKE '% IS NOT NULL'", $this->conn); // ignore default IS NOT NULL checks in PostrgreSQL
+AND t.TABLE_NAME = " . q($table) . (JUSH == "pgsql" ? "
+AND CHECK_CLAUSE NOT LIKE '% IS NOT NULL'" : ""), $this->conn); // ignore default IS NOT NULL checks in PostrgreSQL
 	}
 
 	/** Get all fields in the current schema
@@ -16342,7 +16403,7 @@ class Adminer {
 	* @return string HTML code
 	*/
 	function name() {
-		return "<a href='https://www.adminer.org/'" . target_blank() . " id='h1'><img src='" . h(preg_replace("~\\?.*~", "", ME) . "?file=logo.png&version=5.4.1") . "' width='24' height='24' alt='' id='logo'>Adminer</a>";
+		return "<a href='https://www.adminer.org/'" . target_blank() . " id='h1'><img src='" . h(preg_replace("~\\?.*~", "", ME) . "?file=logo.png&version=5.4.2") . "' width='24' height='24' alt='' id='logo'>Adminer</a>";
 	}
 
 	/** Connection parameters
@@ -16470,14 +16531,14 @@ class Adminer {
 		echo "<table class='layout'>\n";
 		// this is matched by compile.php
 		echo adminer()->loginFormField('driver', '<tr><th>' . lang(24) . '<td>', input_hidden("auth[driver]", "server") . "MySQL / MariaDB");
-		echo adminer()->loginFormField('server', '<tr><th>' . lang(25) . '<td>', '<input name="auth[server]" value="' . h(SERVER) . '" title="hostname[:port]" placeholder="localhost" autocapitalize="off">');
+		echo adminer()->loginFormField('server', '<tr><th>' . lang(25) . '<td>', '<input name="auth[server]" value="' . h(SERVER) . '" title="' . lang(26) . '" placeholder="localhost" autocapitalize="off">');
 		// this is matched by compile.php
-		echo adminer()->loginFormField('username', '<tr><th>' . lang(26) . '<td>', '<input name="auth[username]" id="username" autofocus value="' . h($_GET["username"]) . '" autocomplete="username" autocapitalize="off">');
-		echo adminer()->loginFormField('password', '<tr><th>' . lang(27) . '<td>', '<input type="password" name="auth[password]" autocomplete="current-password">');
-		echo adminer()->loginFormField('db', '<tr><th>' . lang(28) . '<td>', '<input name="auth[db]" value="' . h($_GET["db"]) . '" autocapitalize="off">');
+		echo adminer()->loginFormField('username', '<tr><th>' . lang(27) . '<td>', '<input name="auth[username]" id="username" autofocus value="' . h($_GET["username"]) . '" autocomplete="username" autocapitalize="off">');
+		echo adminer()->loginFormField('password', '<tr><th>' . lang(28) . '<td>', '<input type="password" name="auth[password]" autocomplete="current-password">');
+		echo adminer()->loginFormField('db', '<tr><th>' . lang(29) . '<td>', '<input name="auth[db]" value="' . h($_GET["db"]) . '" autocapitalize="off">');
 		echo "</table>\n";
-		echo "<p><input type='submit' value='" . lang(29) . "'>\n";
-		echo checkbox("auth[permanent]", 1, $_COOKIE["adminer_permanent"], lang(30)) . "\n";
+		echo "<p><input type='submit' value='" . lang(30) . "'>\n";
+		echo checkbox("auth[permanent]", 1, $_COOKIE["adminer_permanent"], lang(31)) . "\n";
 	}
 
 	/** Get login form field
@@ -16493,7 +16554,7 @@ class Adminer {
 	*/
 	function login($login, $password) {
 		if ($password == "") {
-			return lang(31, target_blank());
+			return lang(32, target_blank());
 		}
 		return true;
 	}
@@ -16524,21 +16585,23 @@ class Adminer {
 	function selectLinks(array $tableStatus, $set = "") {
 		$name = $tableStatus["Name"];
 		echo '<p class="links">';
-		$links = array("select" => lang(32));
+		$links = array("select" => lang(33));
 		if (support("table") || support("indexes")) {
-			$links["table"] = lang(33);
+			$links["table"] = lang(34);
 		}
 		$is_view = false;
 		if (support("table")) {
 			$is_view = is_view($tableStatus);
-			if (!$is_view) {
-				$links["create"] = lang(34);
-			} elseif (support("view")) {
-				$links["view"] = lang(35);
+			if ($is_view) {
+				if (support("view")) {
+					$links["view"] = lang(35);
+				}
+			} elseif (function_exists('Adminer\alter_table')) {
+				$links["create"] = lang(36);
 			}
 		}
 		if ($set !== null) {
-			$links["edit"] = lang(36);
+			$links["edit"] = lang(37);
 		}
 		foreach ($links as $key => $val) {
 			echo " <a href='" . h(ME) . "$key=" . urlencode($name) . ($key == "edit" ? $set : "") . "'" . bold(isset($_GET[$key])) . ">$val</a>";
@@ -16576,7 +16639,7 @@ class Adminer {
 		$return = "</p>\n"; // required for IE9 inline edit
 		if (!$failed && ($warnings = driver()->warnings())) {
 			$id = "warnings";
-			$return = ", <a href='#$id'>" . lang(37) . "</a>" . script("qsl('a').onclick = partial(toggle, '$id');", "")
+			$return = ", <a href='#$id'>" . lang(38) . "</a>" . script("qsl('a').onclick = partial(toggle, '$id');", "")
 				. "$return<div id='$id' class='hidden'>\n$warnings</div>\n"
 			;
 		}
@@ -16616,7 +16679,7 @@ class Adminer {
 
 	/** Get a link to use in select table
 	* @param string $val raw value of the field
-	* @param Field $field
+	* @param array{type: string} $field
 	* @return string|void null to create the default link
 	*/
 	function selectLink($val, array $field) {
@@ -16625,7 +16688,7 @@ class Adminer {
 	/** Value printed in select table
 	* @param ?string $val HTML-escaped value to print
 	* @param ?string $link link to foreign key
-	* @param Field $field
+	* @param array{type: string} $field
 	* @param string $original original value before applying editVal() and escaping
 	*/
 	function selectVal($val, $link, array $field, $original) {
@@ -16635,13 +16698,13 @@ class Adminer {
 			: $val)
 		));
 		if (is_blob($field) && !is_utf8($val)) {
-			$return = "<i>" . lang(38, strlen($original)) . "</i>";
+			$return = "<i>" . lang(39, strlen($original)) . "</i>";
 		}
 		return ($link ? "<a href='" . h($link) . "'" . (is_url($link) ? target_blank() : "") . ">$return</a>" : $return);
 	}
 
 	/** Value conversion used in select and edit
-	* @param Field $field
+	* @param array{type: string} $field
 	*/
 	function editVal($val, array $field) {
 		return $val;
@@ -16661,7 +16724,7 @@ class Adminer {
 	function tableStructurePrint(array $fields, $tableStatus = null) {
 		echo "<div class='scrollable'>\n";
 		echo "<table class='nowrap odds'>\n";
-		echo "<thead><tr><th>" . lang(39) . "<td>" . lang(40) . (support("comment") ? "<td>" . lang(41) : "") . "</thead>\n";
+		echo "<thead><tr><th>" . lang(40) . "<td>" . lang(41) . (support("comment") ? "<td>" . lang(42) : "") . "</thead>\n";
 		$structured_types = driver()->structuredTypes();
 		foreach ($fields as $field) {
 			echo "<tr><th>" . h($field["field"]);
@@ -16674,9 +16737,9 @@ class Adminer {
 				. "</span>"
 			;
 			echo ($field["null"] ? " <i>NULL</i>" : "");
-			echo ($field["auto_increment"] ? " <i>" . lang(42) . "</i>" : "");
+			echo ($field["auto_increment"] ? " <i>" . lang(43) . "</i>" : "");
 			$default = h($field["default"]);
-			echo (isset($field["default"]) ? " <span title='" . lang(43) . "'>[<b>" . ($field["generated"] ? "<code class='jush-" . JUSH . "'>$default</code>" : $default) . "</b>]</span>" : "");
+			echo (isset($field["default"]) ? " <span title='" . lang(44) . "'>[<b>" . ($field["generated"] ? "<code class='jush-" . JUSH . "'>$default</code>" : $default) . "</b>]</span>" : "");
 			echo (support("comment") ? "<td>" . h($field["comment"]) : "");
 			echo "\n";
 		}
@@ -16721,7 +16784,7 @@ class Adminer {
 	* @param string[] $columns selectable columns
 	*/
 	function selectColumnsPrint(array $select, array $columns) {
-		print_fieldset("select", lang(44), $select);
+		print_fieldset("select", lang(45), $select);
 		$i = 0;
 		$select[""] = array();
 		foreach ($select as $key => $val) {
@@ -16732,7 +16795,7 @@ class Adminer {
 				$val["col"],
 				($key !== "" ? "selectFieldChange" : "selectAddRow")
 			);
-			echo "<div>" . (driver()->functions || driver()->grouping ? html_select("columns[$i][fun]", array(-1 => "") + array_filter(array(lang(45) => driver()->functions, lang(46) => driver()->grouping)), $val["fun"])
+			echo "<div>" . (driver()->functions || driver()->grouping ? html_select("columns[$i][fun]", array(-1 => "") + array_filter(array(lang(46) => driver()->functions, lang(47) => driver()->grouping)), $val["fun"])
 				. on_help("event.target.value && event.target.value.replace(/ |\$/, '(') + ')'", 1)
 				. script("qsl('select').onchange = function () { helpClose();" . ($key !== "" ? "" : " qsl('select, input', this.parentNode).onchange();") . " };", "")
 				. "($column)" : $column) . "</div>\n";
@@ -16747,13 +16810,13 @@ class Adminer {
 	* @param Index[] $indexes
 	*/
 	function selectSearchPrint(array $where, array $columns, array $indexes) {
-		print_fieldset("search", lang(47), $where);
+		print_fieldset("search", lang(48), $where);
 		foreach ($indexes as $i => $index) {
 			if ($index["type"] == "FULLTEXT") {
 				echo "<div>(<i>" . implode("</i>, <i>", array_map('Adminer\h', $index["columns"])) . "</i>) AGAINST";
 				echo " <input type='search' name='fulltext[$i]' value='" . h(idx($_GET["fulltext"], $i)) . "'>";
 				echo script("qsl('input').oninput = selectFieldChange;", "");
-				echo checkbox("boolean[$i]", 1, isset($_GET["boolean"][$i]), "BOOL");
+				echo (JUSH == 'sql' ? checkbox("boolean[$i]", 1, isset($_GET["boolean"][$i]), "BOOL") : '');
 				echo "</div>\n";
 			}
 		}
@@ -16765,7 +16828,7 @@ class Adminer {
 					$columns,
 					$val["col"],
 					($val ? "selectFieldChange" : "selectAddRow"),
-					"(" . lang(48) . ")"
+					"(" . lang(49) . ")"
 				);
 				echo html_select("where[$i][op]", adminer()->operators(), $val["op"], $change_next);
 				echo "<input type='search' name='where[$i][val]' value='" . h($val["val"]) . "'>";
@@ -16782,23 +16845,23 @@ class Adminer {
 	* @param Index[] $indexes
 	*/
 	function selectOrderPrint(array $order, array $columns, array $indexes) {
-		print_fieldset("sort", lang(49), $order);
+		print_fieldset("sort", lang(50), $order);
 		$i = 0;
 		foreach ((array) $_GET["order"] as $key => $val) {
 			if ($val != "") {
 				echo "<div>" . select_input(" name='order[$i]'", $columns, $val, "selectFieldChange");
-				echo checkbox("desc[$i]", 1, isset($_GET["desc"][$key]), lang(50)) . "</div>\n";
+				echo checkbox("desc[$i]", 1, isset($_GET["desc"][$key]), lang(51)) . "</div>\n";
 				$i++;
 			}
 		}
 		echo "<div>" . select_input(" name='order[$i]'", $columns, "", "selectAddRow");
-		echo checkbox("desc[$i]", 1, false, lang(50)) . "</div>\n";
+		echo checkbox("desc[$i]", 1, false, lang(51)) . "</div>\n";
 		echo "</div></fieldset>\n";
 	}
 
 	/** Print limit box in select */
 	function selectLimitPrint($limit) {
-		echo "<fieldset><legend>" . lang(51) . "</legend><div>"; // <div> for easy styling
+		echo "<fieldset><legend>" . lang(52) . "</legend><div>"; // <div> for easy styling
 		echo "<input type='number' name='limit' class='size' value='" . intval($limit) . "'>";
 		echo script("qsl('input').oninput = selectFieldChange;", "");
 		echo "</div></fieldset>\n";
@@ -16809,7 +16872,7 @@ class Adminer {
 	*/
 	function selectLengthPrint($text_length) {
 		if ($text_length !== null) {
-			echo "<fieldset><legend>" . lang(52) . "</legend><div>";
+			echo "<fieldset><legend>" . lang(53) . "</legend><div>";
 			echo "<input type='number' name='text_length' class='size' value='" . h($text_length) . "'>";
 			echo "</div></fieldset>\n";
 		}
@@ -16819,9 +16882,9 @@ class Adminer {
 	* @param Index[] $indexes
 	*/
 	function selectActionPrint(array $indexes) {
-		echo "<fieldset><legend>" . lang(53) . "</legend><div>";
-		echo "<input type='submit' value='" . lang(44) . "'>";
-		echo " <span id='noindex' title='" . lang(54) . "'></span>";
+		echo "<fieldset><legend>" . lang(54) . "</legend><div>";
+		echo "<input type='submit' value='" . lang(45) . "'>";
+		echo " <span id='noindex' title='" . lang(55) . "'></span>";
 		echo "<script" . nonce() . ">\n";
 		echo "const indexColumns = ";
 		$columns = array();
@@ -16998,13 +17061,13 @@ class Adminer {
 		}
 		$history[$_GET["db"]][] = array($query, time(), $time); // not DB - $_GET["db"] is changed in database.inc.php //! respect $_GET["ns"]
 		$sql_id = "sql-" . count($history[$_GET["db"]]);
-		$return = "<a href='#$sql_id' class='toggle'>" . lang(55) . "</a> <a href='' class='jsonly copy'>🗐</a>\n";
+		$return = "<a href='#$sql_id' class='toggle'>" . lang(56) . "</a> <a href='' class='jsonly copy'>🗐</a>\n";
 		if (!$failed && ($warnings = driver()->warnings())) {
 			$id = "warnings-" . count($history[$_GET["db"]]);
-			$return = "<a href='#$id' class='toggle'>" . lang(37) . "</a>, $return<div id='$id' class='hidden'>\n$warnings</div>\n";
+			$return = "<a href='#$id' class='toggle'>" . lang(38) . "</a>, $return<div id='$id' class='hidden'>\n$warnings</div>\n";
 		}
 		return " <span class='time'>" . @date("H:i:s") . "</span>" // @ - time zone may be not set
-			. " $return<div id='$sql_id' class='hidden'><pre><code class='jush-" . JUSH . "'>" . shorten_utf8($query, 1000) . "</code></pre>"
+			. " $return<div id='$sql_id' class='hidden'><pre><code class='jush-" . JUSH . "'>" . shorten_utf8($query, 1e4) . "</code></pre>"
 			. ($time ? " <span class='time'>($time)</span>" : '')
 			. (support("sql") ? '<p><a href="' . h(str_replace("db=" . urlencode(DB), "db=" . urlencode($_GET["db"]), ME) . 'sql=&history=' . (count($history[$_GET["db"]]) - 1)) . '">' . lang(12) . '</a>' : '')
 			. '</div>'
@@ -17038,7 +17101,7 @@ class Adminer {
 			}
 		}
 		if ($field["auto_increment"] && !$update) {
-			$return = lang(42);
+			$return = lang(43);
 		}
 		return explode("/", $return);
 	}
@@ -17097,7 +17160,7 @@ class Adminer {
 	* @return string[]
 	*/
 	function dumpOutput() {
-		$return = array('text' => lang(56), 'file' => lang(57));
+		$return = array('text' => lang(57), 'file' => lang(58));
 		if (function_exists('gzencode')) {
 			$return['gz'] = 'gzip';
 		}
@@ -17292,15 +17355,15 @@ class Adminer {
 	* @return bool whether to print default homepage
 	*/
 	function homepage() {
-		echo '<p class="links">' . ($_GET["ns"] == "" && support("database") ? '<a href="' . h(ME) . 'database=">' . lang(58) . "</a>\n" : "");
-		echo (support("scheme") ? "<a href='" . h(ME) . "scheme='>" . ($_GET["ns"] != "" ? lang(59) : lang(60)) . "</a>\n" : "");
-		echo ($_GET["ns"] !== "" ? '<a href="' . h(ME) . 'schema=">' . lang(61) . "</a>\n" : "");
-		echo (support("privileges") ? "<a href='" . h(ME) . "privileges='>" . lang(62) . "</a>\n" : "");
+		echo '<p class="links">' . ($_GET["ns"] == "" && support("database") ? '<a href="' . h(ME) . 'database=">' . lang(59) . "</a>\n" : "");
+		echo (support("scheme") ? "<a href='" . h(ME) . "scheme='>" . ($_GET["ns"] != "" ? lang(60) : lang(61)) . "</a>\n" : "");
+		echo ($_GET["ns"] !== "" ? '<a href="' . h(ME) . 'schema=">' . lang(62) . "</a>\n" : "");
+		echo (support("privileges") ? "<a href='" . h(ME) . "privileges='>" . lang(63) . "</a>\n" : "");
 		if ($_GET["ns"] !== "") {
-			echo (support("routine") ? "<a href='#routines'>" . lang(63) . "</a>\n" : "");
-			echo (support("sequence") ? "<a href='#sequences'>" . lang(64) . "</a>\n" : "");
+			echo (support("routine") ? "<a href='#routines'>" . lang(64) . "</a>\n" : "");
+			echo (support("sequence") ? "<a href='#sequences'>" . lang(65) . "</a>\n" : "");
 			echo (support("type") ? "<a href='#user-types'>" . lang(6) . "</a>\n" : "");
-			echo (support("event") ? "<a href='#events'>" . lang(65) . "</a>\n" : "");
+			echo (support("event") ? "<a href='#events'>" . lang(66) . "</a>\n" : "");
 		}
 		return true;
 	}
@@ -17344,14 +17407,14 @@ class Adminer {
 			$actions = array();
 			if (DB == "" || !$missing) {
 				if (support("sql")) {
-					$actions[] = "<a href='" . h(ME) . "sql='" . bold(isset($_GET["sql"]) && !isset($_GET["import"])) . ">" . lang(55) . "</a>";
-					$actions[] = "<a href='" . h(ME) . "import='" . bold(isset($_GET["import"])) . ">" . lang(66) . "</a>";
+					$actions[] = "<a href='" . h(ME) . "sql='" . bold(isset($_GET["sql"]) && !isset($_GET["import"])) . ">" . lang(56) . "</a>";
+					$actions[] = "<a href='" . h(ME) . "import='" . bold(isset($_GET["import"])) . ">" . lang(67) . "</a>";
 				}
-				$actions[] = "<a href='" . h(ME) . "dump=" . urlencode(isset($_GET["table"]) ? $_GET["table"] : $_GET["select"]) . "' id='dump'" . bold(isset($_GET["dump"])) . ">" . lang(67) . "</a>";
+				$actions[] = "<a href='" . h(ME) . "dump=" . urlencode(isset($_GET["table"]) ? $_GET["table"] : $_GET["select"]) . "' id='dump'" . bold(isset($_GET["dump"])) . ">" . lang(68) . "</a>";
 			}
 			$in_db = $_GET["ns"] !== "" && !$missing && DB != "";
-			if ($in_db) {
-				$actions[] = '<a href="' . h(ME) . 'create="' . bold($_GET["create"] === "") . ">" . lang(68) . "</a>";
+			if ($in_db && function_exists('Adminer\alter_table')) {
+				$actions[] = '<a href="' . h(ME) . 'create="' . bold($_GET["create"] === "") . ">" . lang(69) . "</a>";
 			}
 			echo ($actions ? "<p class='links'>\n" . implode("\n", $actions) . "\n" : "");
 			if ($in_db) {
@@ -17369,7 +17432,7 @@ class Adminer {
 	*/
 	function syntaxHighlighting(array $tables) {
 		// this is matched by compile.php
-		echo script_src(preg_replace("~\\?.*~", "", ME) . "?file=jush.js&version=5.4.1", true);
+		echo script_src(preg_replace("~\\?.*~", "", ME) . "?file=jush.js&version=5.4.2", true);
 		if (support("sql")) {
 			echo "<script" . nonce() . ">\n";
 			if ($tables) {
@@ -17413,7 +17476,7 @@ class Adminer {
 		echo "<form action=''>\n<p id='dbs'>\n";
 		hidden_fields_get();
 		$db_events = script("mixin(qsl('select'), {onmousedown: dbMouseDown, onchange: dbChange});");
-		echo "<label title='" . lang(28) . "'>" . lang(69) . ": " . ($databases
+		echo "<label title='" . lang(29) . "'>" . lang(70) . ": " . ($databases
 			? html_select("db", array("" => "") + $databases, DB) . $db_events
 			: "<input name='db' value='" . h(DB) . "' autocapitalize='off' size='19'>\n"
 		) . "</label>";
@@ -17439,17 +17502,31 @@ class Adminer {
 			if ($name != "" && !$status["partition"]) {
 				echo '<li><a href="' . h(ME) . 'select=' . urlencode($table) . '"'
 					. bold($_GET["select"] == $table || $_GET["edit"] == $table, "select")
-					. " title='" . lang(32) . "'>" . lang(70) . "</a> "
+					. " title='" . lang(33) . "'>" . lang(71) . "</a> "
 				;
 				echo (support("table") || support("indexes")
 					? '<a href="' . h(ME) . 'table=' . urlencode($table) . '"'
 						. bold(in_array($table, array($_GET["table"], $_GET["create"], $_GET["indexes"], $_GET["foreign"], $_GET["trigger"], $_GET["check"], $_GET["view"])), (is_view($status) ? "view" : "structure"))
-						. " title='" . lang(33) . "'>$name</a>"
+						. " title='" . lang(34) . "'>$name</a>"
 					: "<span>$name</span>"
 				) . "\n";
 			}
 		}
 		echo "</ul>\n";
+	}
+
+	/** Get server variables
+	* @return list<string[]> [[$name, $value]]
+	*/
+	function showVariables() {
+		return show_variables();
+	}
+
+	/** Get status variables
+	* @return list<string[]> [[$name, $value]]
+	*/
+	function showStatus() {
+		return show_status();
 	}
 
 	/** Get process list
@@ -17484,27 +17561,27 @@ class Plugins {
 			$basename = "adminer-plugins";
 			if (is_dir($basename)) {
 				foreach (glob("$basename/*.php") as $filename) {
-					$include = include_once "./$filename";
+					$this->includeOnce($filename);
 				}
 			}
 			$help = " href='https://www.adminer.org/plugins/#use'" . target_blank();
 			if (file_exists("$basename.php")) {
-				$include = include_once "./$basename.php"; // example: return array(new AdminerLoginOtp($secret))
+				$include = $this->includeOnce("$basename.php"); // example: return array(new AdminerLoginOtp($secret));
 				if (is_array($include)) {
 					foreach ($include as $plugin) {
 						$plugins[get_class($plugin)] = $plugin;
 					}
 				} else {
-					$this->error .= lang(71, "<b>$basename.php</b>", $help) . "<br>";
+					$this->error .= lang(72, "<b>$basename.php</b>", $help) . "<br>";
 				}
 			}
 			foreach (get_declared_classes() as $class) {
-				if (!$plugins[$class] && preg_match('~^Adminer\w~i', $class)) {
+				if (!$plugins[$class] && (preg_match('~^Adminer\w~i', $class) || is_subclass_of($class, 'Adminer\Plugin'))) {
 					// we need to use reflection because PHP 7.1 throws ArgumentCountError for missing arguments but older versions issue a warning
 					$reflection = new \ReflectionClass($class);
 					$constructor = $reflection->getConstructor();
 					if ($constructor && $constructor->getNumberOfRequiredParameters()) {
-						$this->error .= lang(72, $help, "<b>$class</b>", "<b>$basename.php</b>") . "<br>";
+						$this->error .= lang(73, $help, "<b>$class</b>", "<b>$basename.php</b>") . "<br>";
 					} else {
 						$plugins[$class] = new $class;
 					}
@@ -17524,6 +17601,13 @@ class Plugins {
 				}
 			}
 		}
+	}
+
+	/** Separate function to not overwrite local variables
+	* @return array<object>|true
+	*/
+	function includeOnce($filename) {
+		return include_once "./$filename";
 	}
 
 	/**
@@ -17647,7 +17731,7 @@ if (!defined('Adminer\DRIVER')) {
 
 			function attach($server, $username, $password) {
 				if (ini_bool("mysql.allow_local_infile")) {
-					return lang(73, "'mysql.allow_local_infile'", "MySQLi", "PDO_MySQL");
+					return lang(74, "'mysql.allow_local_infile'", "MySQLi", "PDO_MySQL");
 				}
 				$this->link = @mysql_connect(
 					($server != "" ? $server : ini_get("mysql.default_host")),
@@ -17817,12 +17901,12 @@ if (!defined('Adminer\DRIVER')) {
 		function __construct(Db $connection) {
 			parent::__construct($connection);
 			$this->types = array(
-				lang(74) => array("tinyint" => 3, "smallint" => 5, "mediumint" => 8, "int" => 10, "bigint" => 20, "decimal" => 66, "float" => 12, "double" => 21),
-				lang(75) => array("date" => 10, "datetime" => 19, "timestamp" => 19, "time" => 10, "year" => 4),
-				lang(76) => array("char" => 255, "varchar" => 65535, "tinytext" => 255, "text" => 65535, "mediumtext" => 16777215, "longtext" => 4294967295),
-				lang(77) => array("enum" => 65535, "set" => 64),
-				lang(78) => array("bit" => 20, "binary" => 255, "varbinary" => 65535, "tinyblob" => 255, "blob" => 65535, "mediumblob" => 16777215, "longblob" => 4294967295),
-				lang(79) => array("geometry" => 0, "point" => 0, "linestring" => 0, "polygon" => 0, "multipoint" => 0, "multilinestring" => 0, "multipolygon" => 0, "geometrycollection" => 0),
+				lang(75) => array("tinyint" => 3, "smallint" => 5, "mediumint" => 8, "int" => 10, "bigint" => 20, "decimal" => 66, "float" => 12, "double" => 21),
+				lang(76) => array("date" => 10, "datetime" => 19, "timestamp" => 19, "time" => 10, "year" => 4),
+				lang(77) => array("char" => 255, "varchar" => 65535, "tinytext" => 255, "text" => 65535, "mediumtext" => 16777215, "longtext" => 4294967295),
+				lang(78) => array("enum" => 65535, "set" => 64),
+				lang(79) => array("bit" => 20, "binary" => 255, "varbinary" => 65535, "tinyblob" => 255, "blob" => 65535, "mediumblob" => 16777215, "longblob" => 4294967295),
+				lang(80) => array("geometry" => 0, "point" => 0, "linestring" => 0, "polygon" => 0, "multipoint" => 0, "multilinestring" => 0, "multipolygon" => 0, "geometrycollection" => 0),
 			);
 			$this->insertFunctions = array(
 				"char" => "md5/sha1/password/encrypt/uuid",
@@ -17836,14 +17920,14 @@ if (!defined('Adminer\DRIVER')) {
 				"char|text" => "concat",
 			);
 			if (min_version('5.7.8', 10.2, $connection)) {
-				$this->types[lang(76)]["json"] = 4294967295;
+				$this->types[lang(77)]["json"] = 4294967295;
 			}
 			if (min_version('', 10.7, $connection)) {
-				$this->types[lang(76)]["uuid"] = 128;
+				$this->types[lang(77)]["uuid"] = 128;
 				$this->insertFunctions['uuid'] = 'uuid';
 			}
 			if (min_version(9, '', $connection)) {
-				$this->types[lang(74)]["vector"] = 16383;
+				$this->types[lang(75)]["vector"] = 16383;
 				$this->insertFunctions['vector'] = 'string_to_vector';
 			}
 			if (min_version(5.1, '', $connection)) {
@@ -18480,36 +18564,27 @@ if (!defined('Adminer\DRIVER')) {
 	* @return Routine
 	*/
 	function routine($name, $type) {
-		$aliases = array("bool", "boolean", "integer", "double precision", "real", "dec", "numeric", "fixed", "national char", "national varchar");
-		$space = "(?:\\s|/\\*[\s\S]*?\\*/|(?:#|-- )[^\n]*\n?|--\r?\n)";
-		$enum = driver()->enumLength;
-		$type_pattern = "((" . implode("|", array_merge(array_keys(driver()->types()), $aliases)) . ")\\b(?:\\s*\\(((?:[^'\")]|$enum)++)\\))?"
-			. "\\s*(zerofill\\s*)?(unsigned(?:\\s+zerofill)?)?)(?:\\s*(?:CHARSET|CHARACTER\\s+SET)\\s*['\"]?([^'\"\\s,]+)['\"]?)?(?:\\s*COLLATE\\s*['\"]?[^'\"\\s,]+['\"]?)?"; //! store COLLATE
-		$pattern = "$space*(" . ($type == "FUNCTION" ? "" : driver()->inout) . ")?\\s*(?:`((?:[^`]|``)*)`\\s*|\\b(\\S+)\\s+)$type_pattern";
-		$create = get_val("SHOW CREATE $type " . idf_escape($name), 2);
-		preg_match("~\\(((?:$pattern\\s*,?)*)\\)\\s*" . ($type == "FUNCTION" ? "RETURNS\\s+$type_pattern\\s+" : "") . "(.*)~is", $create, $match);
-		$fields = array();
-		preg_match_all("~$pattern\\s*,?~is", $match[1], $matches, PREG_SET_ORDER);
-		foreach ($matches as $param) {
-			$fields[] = array(
-				"field" => str_replace("``", "`", $param[2]) . $param[3],
-				"type" => strtolower($param[5]),
-				"length" => preg_replace_callback("~$enum~s", 'Adminer\normalize_enum', $param[6]),
-				"unsigned" => strtolower(preg_replace('~\s+~', ' ', trim("$param[8] $param[7]"))),
-				"null" => true,
-				"full_type" => $param[4],
-				"inout" => strtoupper($param[1]),
-				"collation" => strtolower($param[9]),
-			);
+		$fields = get_rows("SELECT
+	PARAMETER_NAME field,
+	DATA_TYPE type,
+	CHARACTER_MAXIMUM_LENGTH length,
+	REGEXP_REPLACE(DTD_IDENTIFIER, '^[^ ]+ ', '') `unsigned`,
+	1 `null`,
+	DTD_IDENTIFIER full_type,
+	PARAMETER_MODE `inout`,
+	CHARACTER_SET_NAME collation
+FROM information_schema.PARAMETERS
+WHERE SPECIFIC_SCHEMA = DATABASE() AND ROUTINE_TYPE = '$type' AND SPECIFIC_NAME = " . q($name) . "
+ORDER BY ORDINAL_POSITION");
+		$return = connection()->query("SELECT ROUTINE_COMMENT comment, ROUTINE_DEFINITION definition, 'SQL' language
+FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = '$type' AND ROUTINE_NAME = " . q($name))->fetch_assoc();
+		if ($fields && $fields[0]['field'] == '') {
+			$return['returns'] = array_shift($fields);
 		}
-		return array(
-			"fields" => $fields,
-			"comment" => get_val("SELECT ROUTINE_COMMENT FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_NAME = " . q($name)),
-		) + ($type != "FUNCTION" ? array("definition" => $match[11]) : array(
-			"returns" => array("type" => $match[12], "length" => $match[13], "unsigned" => $match[15], "collation" => $match[16]),
-			"definition" => $match[17],
-			"language" => "SQL", // available in information_schema.ROUTINES.BODY_STYLE
-		));
+		$return['fields'] = $fields;
+		/** @phpstan-var Routine */
+		return $return;
 	}
 
 	/** Get list of routines
@@ -18749,12 +18824,12 @@ function page_header($title, $error = "", $breadcrumb = array(), $title2 = "") {
 	// initial-scale=1 is the default but Chrome 134 on iOS is not able to zoom out without it
 	?>
 <!DOCTYPE html>
-<html lang="<?php echo LANG; ?>" dir="<?php echo lang(80); ?>">
+<html lang="<?php echo LANG; ?>" dir="<?php echo lang(81); ?>">
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 <meta name="robots" content="noindex">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title><?php echo $title_page; ?></title>
-<link rel="stylesheet" href="<?php echo h(preg_replace("~\\?.*~", "", ME) . "?file=default.css&version=5.4.1"); ?>">
+<link rel="stylesheet" href="<?php echo h(preg_replace("~\\?.*~", "", ME) . "?file=default.css&version=5.4.2"); ?>">
 <?php
 
 	$css = adminer()->css();
@@ -18769,15 +18844,15 @@ function page_header($title, $error = "", $breadcrumb = array(), $title2 = "") {
 	);
 	$media = " media='(prefers-color-scheme: dark)'";
 	if ($dark !== false) {
-		echo "<link rel='stylesheet'" . ($dark ? "" : $media) . " href='" . h(preg_replace("~\\?.*~", "", ME) . "?file=dark.css&version=5.4.1") . "'>\n";
+		echo "<link rel='stylesheet'" . ($dark ? "" : $media) . " href='" . h(preg_replace("~\\?.*~", "", ME) . "?file=dark.css&version=5.4.2") . "'>\n";
 	}
 	echo "<meta name='color-scheme' content='" . ($dark === null ? "light dark" : ($dark ? "dark" : "light")) . "'>\n";
 
 	// this is matched by compile.php
-	echo script_src(preg_replace("~\\?.*~", "", ME) . "?file=functions.js&version=5.4.1");
+	echo script_src(preg_replace("~\\?.*~", "", ME) . "?file=functions.js&version=5.4.2");
 		if (adminer()->head($dark)) {
 		echo "<link rel='icon' href='data:image/gif;base64,R0lGODlhEAAQAJEAAAQCBPz+/PwCBAROZCH5BAEAAAAALAAAAAAQABAAAAI2hI+pGO1rmghihiUdvUBnZ3XBQA7f05mOak1RWXrNq5nQWHMKvuoJ37BhVEEfYxQzHjWQ5qIAADs='>\n";
-		echo "<link rel='apple-touch-icon' href='" . h(preg_replace("~\\?.*~", "", ME) . "?file=logo.png&version=5.4.1") . "'>\n";
+		echo "<link rel='apple-touch-icon' href='" . h(preg_replace("~\\?.*~", "", ME) . "?file=logo.png&version=5.4.2") . "'>\n";
 	}
 	foreach ($css as $url => $mode) {
 		$attrs = ($mode == 'dark' && !$dark
@@ -18786,31 +18861,15 @@ function page_header($title, $error = "", $breadcrumb = array(), $title2 = "") {
 		);
 		echo "<link rel='stylesheet'$attrs href='" . h($url) . "'>\n";
 	}
-	echo "\n<body class='" . lang(80) . " nojs";
+	echo "\n<body class='" . lang(81) . " nojs";
 	adminer()->bodyClass();
 	echo "'>\n";
 	$filename = get_temp_dir() . "/adminer.version";
-	if (!$_COOKIE["adminer_version"] && function_exists('openssl_verify') && file_exists($filename) && filemtime($filename) + 86400 > time()) { // 86400 - 1 day in seconds
-		$version = unserialize(file_get_contents($filename));
-		$public = "-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwqWOVuF5uw7/+Z70djoK
-RlHIZFZPO0uYRezq90+7Amk+FDNd7KkL5eDve+vHRJBLAszF/7XKXe11xwliIsFs
-DFWQlsABVZB3oisKCBEuI71J4kPH8dKGEWR9jDHFw3cWmoH3PmqImX6FISWbG3B8
-h7FIx3jEaw5ckVPVTeo5JRm/1DZzJxjyDenXvBQ/6o9DgZKeNDgxwKzH+sw9/YCO
-jHnq1cFpOIISzARlrHMa/43YfeNRAm/tsBXjSxembBPo7aQZLAWHmaj5+K19H10B
-nCpz9Y++cipkVEiKRGih4ZEvjoFysEOdRLj6WiD/uUNky4xGeA6LaJqh5XpkFkcQ
-fQIDAQAB
------END PUBLIC KEY-----
-";
-		if (openssl_verify($version["version"], base64_decode($version["signature"]), $public) == 1) {
-			$_COOKIE["adminer_version"] = $version["version"]; // doesn't need to send to the browser
-		}
-	}
 	echo script("mixin(document.body, {onkeydown: bodyKeydown, onclick: bodyClick"
-		. (isset($_COOKIE["adminer_version"]) ? "" : ", onload: partial(verifyVersion, '" . VERSION . "', '" . js_escape(ME) . "', '" . get_token() . "')")
+		. (isset($_COOKIE["adminer_version"]) ? "" : ", onload: partial(verifyVersion, '" . VERSION . "')")
 		. "});
 document.body.classList.replace('nojs', 'js');
-const offlineMessage = '" . js_escape(lang(81)) . "';
+const offlineMessage = '" . js_escape(lang(82)) . "';
 const thousandsSeparator = '" . js_escape(lang(4)) . "';")
 	;
 	echo "<div id='help' class='jush-" . JUSH . " jsonly hidden'></div>\n";
@@ -18881,8 +18940,8 @@ function csp() {
 	return array(
 		array(
 			"script-src" => "'self' 'unsafe-inline' 'nonce-" . get_nonce() . "' 'strict-dynamic'", // 'self' is a fallback for browsers not supporting 'strict-dynamic', 'unsafe-inline' is a fallback for browsers not supporting 'nonce-'
-			"connect-src" => "'self'",
-			"frame-src" => "https://www.adminer.org",
+			"connect-src" => "'self' https://www.adminer.org",
+			"frame-src" => "'none'",
 			"object-src" => "'none'",
 			"base-uri" => "'none'",
 			"form-action" => "'self'",
@@ -18929,7 +18988,7 @@ function page_footer($missing = "") {
 <form action="" method="post">
 <p class="logout">
 <span><?php echo h($_GET["username"]) . "\n"; ?></span>
-<input type="submit" name="logout" value="<?php echo lang(82); ?>" id="logout">
+<input type="submit" name="logout" value="<?php echo lang(83); ?>" id="logout">
 <?php echo input_token(); ?>
 </form>
 <?php
@@ -19104,7 +19163,7 @@ function check_invalid_login(array &$permanent) {
 	$invalid = idx($invalids, adminer()->bruteForceKey(), array());
 	$next_attempt = ($invalid[1] > 29 ? $invalid[0] - time() : 0); // allow 30 invalid attempts
 	if ($next_attempt > 0) { //! do the same with permanent login
-		auth_error(lang(83, ceil($next_attempt / 60)), $permanent);
+		auth_error(lang(84, ceil($next_attempt / 60)), $permanent);
 	}
 }
 
@@ -19139,7 +19198,7 @@ if ($auth) {
 		set_session($key, null);
 	}
 	unset_permanent($permanent);
-	redirect(substr(preg_replace('~\b(username|db|ns)=[^&]*&~', '', ME), 0, -1), lang(84) . ' ' . lang(85));
+	redirect(substr(preg_replace('~\b(username|db|ns)=[^&]*&~', '', ME), 0, -1), lang(85) . ' ' . lang(86));
 
 } elseif ($permanent && !$_SESSION["pwds"]) {
 	session_regenerate_id();
@@ -19175,14 +19234,14 @@ function auth_error($error, array &$permanent) {
 	if (isset($_GET["username"])) {
 		header("HTTP/1.1 403 Forbidden"); // 401 requires sending WWW-Authenticate header
 		if (($_COOKIE[$session_name] || $_GET[$session_name]) && !$_SESSION["token"]) {
-			$error = lang(86);
+			$error = lang(87);
 		} else {
 			restart_session();
 			add_invalid_login();
 			$password = get_password();
 			if ($password !== null) {
 				if ($password === false) {
-					$error .= ($error ? '<br>' : '') . lang(87, target_blank(), '<code>permanentLogin()</code>');
+					$error .= ($error ? '<br>' : '') . lang(88, target_blank(), '<code>permanentLogin()</code>');
 				}
 				set_password(DRIVER, SERVER, $_GET["username"], null);
 			}
@@ -19190,18 +19249,18 @@ function auth_error($error, array &$permanent) {
 		}
 	}
 	if (!$_COOKIE[$session_name] && $_GET[$session_name] && ini_bool("session.use_only_cookies")) {
-		$error = lang(88);
+		$error = lang(89);
 	}
 	$params = session_get_cookie_params();
 	cookie("adminer_key", ($_COOKIE["adminer_key"] ?: rand_string()), $params["lifetime"]);
 	if (!$_SESSION["token"]) {
 		$_SESSION["token"] = rand(1, 1e6); // this is for next attempt
 	}
-	page_header(lang(29), $error, null);
+	page_header(lang(30), $error, null);
 	echo "<form action='' method='post'>\n";
 	echo "<div>";
 	if (hidden_fields($_POST, array("auth"))) { // expired session
-		echo "<p class='message'>" . lang(89) . "\n";
+		echo "<p class='message'>" . lang(90) . "\n";
 	}
 	echo "</div>\n";
 	adminer()->loginForm();
@@ -19213,7 +19272,7 @@ function auth_error($error, array &$permanent) {
 if (isset($_GET["username"]) && !class_exists('Adminer\Db')) {
 	unset($_SESSION["pwds"][DRIVER]);
 	unset_permanent($permanent);
-	page_header(lang(90), lang(91, implode(", ", Driver::$extensions)), false);
+	page_header(lang(91), lang(92, implode(", ", Driver::$extensions)), false);
 	page_footer("auth");
 	exit;
 }
@@ -19222,7 +19281,7 @@ $connection = '';
 if (isset($_GET["username"]) && is_string(get_password())) {
 	list(, $port) = host_port(SERVER);
 	if (preg_match('~^\s*([-+]?\d+)~', $port, $match) && ($match[1] < 1024 || $match[1] > 65535)) { // is_numeric('80#') would still connect to port 80
-		auth_error(lang(92), $permanent);
+		auth_error(lang(93), $permanent);
 	}
 	check_invalid_login($permanent);
 	$credentials = adminer()->credentials();
@@ -19238,13 +19297,13 @@ if (isset($_GET["username"]) && is_string(get_password())) {
 
 $login = null;
 if (!is_object($connection) || ($login = adminer()->login($_GET["username"], get_password())) !== true) {
-	$error = (is_string($connection) ? nl_br(h($connection)) : (is_string($login) ? $login : lang(93)))
-		. (preg_match('~^ | $~', get_password()) ? '<br>' . lang(94) : '');
+	$error = (is_string($connection) ? nl_br(h($connection)) : (is_string($login) ? $login : lang(94)))
+		. (preg_match('~^ | $~', get_password()) ? '<br>' . lang(95) : '');
 	auth_error($error, $permanent);
 }
 
 if ($_POST["logout"] && $_SESSION["token"] && !verify_token()) {
-	page_header(lang(82), lang(95));
+	page_header(lang(83), lang(96));
 	page_footer("db");
 	exit;
 }
@@ -19272,16 +19331,16 @@ if ($_POST) {
 			}
 		}
 		$error = (!$_POST["token"] && $max_vars
-			? lang(96, "'$ini'")
-			: lang(95) . ' ' . lang(97)
+			? lang(97, "'$ini'")
+			: lang(96) . ' ' . lang(98)
 		);
 	}
 
 } elseif ($_SERVER["REQUEST_METHOD"] == "POST") {
 	// posted form with no data means that post_max_size exceeded because Adminer always sends token at least
-	$error = lang(98, "'post_max_size'");
+	$error = lang(99, "'post_max_size'");
 	if (isset($_GET["sql"])) {
-		$error .= ' ' . lang(99);
+		$error .= ' ' . lang(100);
 	}
 }
 
@@ -19363,22 +19422,11 @@ function print_select_result($result, $connection2 = null, array $orgtables = ar
 						$link .= "&where" . urlencode("[" . bracket_escape($col) . "]") . "=" . urlencode($row[$j]);
 					}
 				}
-			} elseif (is_url($val)) {
-				$link = $val;
 			}
-			if ($val === null) {
-				$val = "<i>NULL</i>";
-			} elseif ($blobs[$key] && !is_utf8($val)) {
-				$val = "<i>" . lang(38, strlen($val)) . "</i>"; //! link to download
-			} else {
-				$val = h($val);
-				if ($types[$key] == 254) { // 254 - char
-					$val = "<code>$val</code>";
-				}
-			}
-			if ($link) {
-				$val = "<a href='" . h($link) . "'" . (is_url($link) ? target_blank() : '') . ">$val</a>";
-			}
+			$field = array(
+				'type' => ($blobs[$key] ? 'blob' : ($types[$key] == 254 ? 'char' : '')),
+			);
+			$val = select_value($val, $link, $field, null);
 			// https://dev.mysql.com/doc/dev/mysql-server/latest/field__types_8h.html
 			echo "<td" . ($types[$key] <= 9 || $types[$key] == 246 ? " class='number'" : "") . ">$val";
 		}
@@ -19466,7 +19514,7 @@ function edit_type($key, array $field, array $collations, array $foreign_keys = 
 	}
 	$structured_types = driver()->structuredTypes();
 	if ($foreign_keys) {
-		$structured_types[lang(100)] = $foreign_keys;
+		$structured_types[lang(101)] = $foreign_keys;
 	}
 	echo optionlist(array_merge($extra_types, $structured_types), $type);
 	echo "</select><td>";
@@ -19475,16 +19523,16 @@ function edit_type($key, array $field, array $collations, array $foreign_keys = 
 		. " aria-labelledby='label-length'>";
 	echo "<td class='options'>";
 	echo ($collations
-		? "<input list='collations' name='" . h($key) . "[collation]'" . (preg_match('~(char|text|enum|set)$~', $type) ? "" : " class='hidden'") . " value='" . h($field["collation"]) . "' placeholder='(" . lang(101) . ")'>"
+		? "<input list='collations' name='" . h($key) . "[collation]'" . (preg_match('~(char|text|enum|set)$~', $type) ? "" : " class='hidden'") . " value='" . h($field["collation"]) . "' placeholder='(" . lang(102) . ")'>"
 		: ''
 	);
 	echo (driver()->unsigned ? "<select name='" . h($key) . "[unsigned]'" . (!$type || preg_match(number_type(), $type) ? "" : " class='hidden'") . '><option>' . optionlist(driver()->unsigned, $field["unsigned"]) . '</select>' : '');
 	echo (isset($field['on_update']) ? "<select name='" . h($key) . "[on_update]'" . (preg_match('~timestamp|datetime~', $type) ? "" : " class='hidden'") . '>'
-		. optionlist(array("" => "(" . lang(102) . ")", "CURRENT_TIMESTAMP"), (preg_match('~^CURRENT_TIMESTAMP~i', $field["on_update"]) ? "CURRENT_TIMESTAMP" : $field["on_update"]))
+		. optionlist(array("" => "(" . lang(103) . ")", "CURRENT_TIMESTAMP"), (preg_match('~^CURRENT_TIMESTAMP~i', $field["on_update"]) ? "CURRENT_TIMESTAMP" : $field["on_update"]))
 		. '</select>' : ''
 	);
 	echo ($foreign_keys
-		? "<select name='" . h($key) . "[on_delete]'" . (preg_match("~`~", $type) ? "" : " class='hidden'") . "><option value=''>(" . lang(103) . ")" . optionlist(explode("|", driver()->onActions), $field["on_delete"]) . "</select> "
+		? "<select name='" . h($key) . "[on_delete]'" . (preg_match("~`~", $type) ? "" : " class='hidden'") . "><option value=''>(" . lang(104) . ")" . optionlist(explode("|", driver()->onActions), $field["on_delete"]) . "</select> "
 		: " " // space for IE
 	);
 }
@@ -19534,15 +19582,18 @@ function process_field(array $field, array $type_field) {
 * @param Field $field
 */
 function default_value(array $field) {
-	$default = $field["default"];
+	if ($field["default"] === null) {
+		return "";
+	}
+	$default = str_replace("\r", "", $field["default"]);
 	$generated = $field["generated"];
-	return ($default === null ? "" : (in_array($generated, driver()->generated)
-		? (JUSH == "mssql" ? " AS ($default)" . ($generated == "VIRTUAL" ? "" : " $generated") . "" : " GENERATED ALWAYS AS ($default) $generated")
+	return (in_array($generated, driver()->generated)
+		? (JUSH == "mssql" ? " AS ($default)" . ($generated == "VIRTUAL" ? "" : " $generated") : " GENERATED ALWAYS AS ($default) $generated")
 		: " DEFAULT " . (!preg_match('~^GENERATED ~i', $default) && (preg_match('~char|binary|text|json|enum|set~', $field["type"]) || preg_match('~^(?![a-z])~i', $default))
 			? (JUSH == "sql" && preg_match('~text|json~', $field["type"]) ? "(" . q($default) . ")" : q($default)) // MySQL requires () around default value of text column
 			: str_ireplace("current_timestamp()", "CURRENT_TIMESTAMP", (JUSH == "sqlite" ? "($default)" : $default))
 		)
-	));
+	);
 }
 
 /** Get type class to use in CSS
@@ -19575,13 +19626,13 @@ function edit_fields(array $fields, array $collations, $type = "TABLE", array $f
 	$comment_class = (($_POST ? $_POST["comments"] : get_setting("comments")) ? "" : " class='hidden'");
 	echo "<thead><tr>\n";
 	echo ($type == "PROCEDURE" ? "<td>" : "");
-	echo "<th id='label-name'>" . ($type == "TABLE" ? lang(104) : lang(105));
-	echo "<td id='label-type'>" . lang(40) . "<textarea id='enum-edit' rows='4' cols='12' wrap='off' style='display: none;'></textarea>" . script("qs('#enum-edit').onblur = editingLengthBlur;");
-	echo "<td id='label-length'>" . lang(106);
-	echo "<td>" . lang(107); // no label required, options have their own label
+	echo "<th id='label-name'>" . ($type == "TABLE" ? lang(105) : lang(106));
+	echo "<td id='label-type'>" . lang(41) . "<textarea id='enum-edit' rows='4' cols='12' wrap='off' style='display: none;'></textarea>" . script("qs('#enum-edit').onblur = editingLengthBlur;");
+	echo "<td id='label-length'>" . lang(107);
+	echo "<td>" . lang(108); // no label required, options have their own label
 	if ($type == "TABLE") {
 		echo "<td id='label-null'>NULL\n";
-		echo "<td><input type='radio' name='auto_increment_col' value=''><abbr id='label-ai' title='" . lang(42) . "'>AI</abbr>";
+		echo "<td><input type='radio' name='auto_increment_col' value=''><abbr id='label-ai' title='" . lang(43) . "'>AI</abbr>";
 		echo doc_link(array(
 			'sql' => "example-auto-increment.html",
 			'mariadb' => "auto_increment/",
@@ -19589,10 +19640,10 @@ function edit_fields(array $fields, array $collations, $type = "TABLE", array $f
 			
 			
 		));
-		echo "<td id='label-default'$default_class>" . lang(43);
-		echo (support("comment") ? "<td id='label-comment'$comment_class>" . lang(41) : "");
+		echo "<td id='label-default'$default_class>" . lang(44);
+		echo (support("comment") ? "<td id='label-comment'$comment_class>" . lang(42) : "");
 	}
-	echo "<td>" . icon("plus", "add[" . (support("move_col") ? 0 : count($fields)) . "]", "+", lang(108));
+	echo "<td>" . icon("plus", "add[" . (support("move_col") ? 0 : count($fields)) . "]", "+", lang(109));
 	echo "</thead>\n<tbody>\n";
 	echo script("mixin(qsl('tbody'), {onclick: editingClick, onkeydown: editingKeydown, oninput: editingInput});");
 	foreach ($fields as $i => $field) {
@@ -19613,16 +19664,18 @@ function edit_fields(array $fields, array $collations, $type = "TABLE", array $f
 				? html_select("fields[$i][generated]", array_merge(array("", "DEFAULT"), driver()->generated), $field["generated"]) . " "
 				: checkbox("fields[$i][generated]", 1, $field["generated"], "", "", "", "label-default")
 			);
-			echo "<input name='fields[$i][default]' value='" . h($field["default"]) . "' aria-labelledby='label-default'>";
+			$attrs = " name='fields[$i][default]' aria-labelledby='label-default'";
+			$value = h($field["default"]);
+			echo (preg_match('~\n~', $field["default"]) ? "<textarea$attrs rows='2' cols='30' style='vertical-align: bottom;'>\n$value</textarea>" : "<input$attrs value='$value'>"); // \n to preserve the leading newline
 			echo (support("comment") ? "<td$comment_class><input name='fields[$i][comment]' value='" . h($field["comment"]) . "' data-maxlength='" . (min_version(5.5) ? 1024 : 255) . "' aria-labelledby='label-comment'>" : "");
 		}
 		echo "<td>";
 		echo (support("move_col") ?
-			icon("plus", "add[$i]", "+", lang(108)) . " "
-			. icon("up", "up[$i]", "↑", lang(109)) . " "
-			. icon("down", "down[$i]", "↓", lang(110)) . " "
+			icon("plus", "add[$i]", "+", lang(109)) . " "
+			. icon("up", "up[$i]", "↑", lang(110)) . " "
+			. icon("down", "down[$i]", "↓", lang(111)) . " "
 		: "");
-		echo ($orig == "" || support("drop_col") ? icon("cross", "drop_col[$i]", "x", lang(111)) : "");
+		echo ($orig == "" || support("drop_col") ? icon("cross", "drop_col[$i]", "x", lang(112)) : "");
 	}
 }
 
@@ -19775,6 +19828,7 @@ function format_foreign_key(array $foreign_key) {
 		. " (" . implode(", ", array_map('Adminer\idf_escape', $foreign_key["target"])) . ")" //! reuse $name - check in older MySQL versions
 		. (preg_match("~^(" . driver()->onActions . ")\$~", $foreign_key["on_delete"]) ? " ON DELETE $foreign_key[on_delete]" : "")
 		. (preg_match("~^(" . driver()->onActions . ")\$~", $foreign_key["on_update"]) ? " ON UPDATE $foreign_key[on_update]" : "")
+		. ($foreign_key["deferrable"] ? " $foreign_key[deferrable]" : "")
 	;
 }
 
@@ -19860,29 +19914,29 @@ if (
 	}
 	if (DB != "") {
 		header("HTTP/1.1 404 Not Found");
-		page_header(lang(28) . ": " . h(DB), lang(112), true);
+		page_header(lang(29) . ": " . h(DB), lang(113), true);
 	} else {
 		if ($_POST["db"] && !$error) {
-			queries_redirect(substr(ME, 0, -1), lang(113), drop_databases($_POST["db"]));
+			queries_redirect(substr(ME, 0, -1), lang(114), drop_databases($_POST["db"]));
 		}
 
-		page_header(lang(114), $error, false);
+		page_header(lang(115), $error, false);
 		echo "<p class='links'>\n";
 		foreach (
 			array(
-				'database' => lang(115),
-				'privileges' => lang(62),
-				'processlist' => lang(116),
-				'variables' => lang(117),
-				'status' => lang(118),
+				'database' => lang(116),
+				'privileges' => lang(63),
+				'processlist' => lang(117),
+				'variables' => lang(118),
+				'status' => lang(119),
 			) as $key => $val
 		) {
 			if (support($key)) {
 				echo "<a href='" . h(ME) . "$key='>$val</a>\n";
 			}
 		}
-		echo "<p>" . lang(119, get_driver(DRIVER), "<b>" . h(connection()->server_info) . "</b>", "<b>" . connection()->extension . "</b>") . "\n";
-		echo "<p>" . lang(120, "<b>" . h(logged_user()) . "</b>") . "\n";
+		echo "<p>" . lang(120, get_driver(DRIVER), "<b>" . h(connection()->server_info) . "</b>", "<b>" . connection()->extension . "</b>") . "\n";
+		echo "<p>" . lang(121, "<b>" . h(logged_user()) . "</b>") . "\n";
 
 		$databases = adminer()->databases();
 		if ($databases) {
@@ -19893,10 +19947,10 @@ if (
 			echo script("mixin(qsl('table'), {onclick: tableClick, ondblclick: partialArg(tableClick, true)});");
 			echo "<thead><tr>"
 				. (support("database") ? "<td>" : "")
-				. "<th>" . lang(28) . (get_session("dbs") !== null ? " - <a href='" . h(ME) . "refresh=1'>" . lang(121) . "</a>" : "")
-				. "<td>" . lang(122)
+				. "<th>" . lang(29) . (get_session("dbs") !== null ? " - <a href='" . h(ME) . "refresh=1'>" . lang(122) . "</a>" : "")
 				. "<td>" . lang(123)
-				. "<td>" . lang(124) . " - <a href='" . h(ME) . "dbsize=1'>" . lang(125) . "</a>" . script("qsl('a').onclick = partial(ajaxSetHtml, '" . js_escape(ME) . "script=connect');", "")
+				. "<td>" . lang(124)
+				. "<td>" . lang(125) . " - <a href='" . h(ME) . "dbsize=1'>" . lang(126) . "</a>" . script("qsl('a').onclick = partial(ajaxSetHtml, '" . js_escape(ME) . "script=connect');", "")
 				. "</thead>\n"
 			;
 
@@ -19907,8 +19961,8 @@ if (
 				echo "<tr>" . (support("database") ? "<td>" . checkbox("db[]", $db, in_array($db, (array) $_POST["db"]), "", "", "", $id) : "");
 				echo "<th><a href='$root' id='$id'>" . h($db) . "</a>";
 				$collation = h(db_collation($db, $collations));
-				echo "<td>" . (support("database") ? "<a href='$root" . ($scheme ? "&amp;ns=" : "") . "&amp;database=' title='" . lang(58) . "'>$collation</a>" : $collation);
-				echo "<td align='right'><a href='$root&amp;schema=' id='tables-" . h($db) . "' title='" . lang(61) . "'>" . ($_GET["dbsize"] ? $tables : "?") . "</a>";
+				echo "<td>" . (support("database") ? "<a href='$root" . ($scheme ? "&amp;ns=" : "") . "&amp;database=' title='" . lang(59) . "'>$collation</a>" : $collation);
+				echo "<td align='right'><a href='$root&amp;schema=' id='tables-" . h($db) . "' title='" . lang(62) . "'>" . ($_GET["dbsize"] ? $tables : "?") . "</a>";
 				echo "<td align='right' id='size-" . h($db) . "'>" . ($_GET["dbsize"] ? db_size($db) : "?");
 				echo "\n";
 			}
@@ -19916,9 +19970,9 @@ if (
 			echo "</table>\n";
 			echo (support("database")
 				? "<div class='footer'><div>\n"
-					. "<fieldset><legend>" . lang(126) . " <span id='selected'></span></legend><div>\n"
+					. "<fieldset><legend>" . lang(127) . " <span id='selected'></span></legend><div>\n"
 					. input_hidden("all") . script("qsl('input').onclick = function () { selectCount('selected', formChecked(this, /^db/)); };") // used by trCheck()
-					. "<input type='submit' name='drop' value='" . lang(127) . "'>" . confirm() . "\n"
+					. "<input type='submit' name='drop' value='" . lang(128) . "'>" . confirm() . "\n"
 					. "</div></fieldset>\n"
 					. "</div></div>\n"
 				: ""
@@ -19930,7 +19984,7 @@ if (
 
 		if (!empty(adminer()->plugins)) {
 			echo "<div class='plugins'>\n";
-			echo "<h3>" . lang(128) . "</h3>\n<ul>\n";
+			echo "<h3>" . lang(129) . "</h3>\n<ul>\n";
 			foreach (adminer()->plugins as $plugin) {
 				$description = (method_exists($plugin, 'description') ? $plugin->description() : "");
 				if (!$description) {
@@ -19942,7 +19996,7 @@ if (
 				$screenshot = (method_exists($plugin, 'screenshot') ? $plugin->screenshot() : "");
 				echo "<li><b>" . get_class($plugin) . "</b>"
 					. h($description ? ": $description" : "")
-					. ($screenshot ? " (<a href='" . h($screenshot) . "'" . target_blank() . ">" . lang(129) . "</a>)" : "")
+					. ($screenshot ? " (<a href='" . h($screenshot) . "'" . target_blank() . ">" . lang(130) . "</a>)" : "")
 					. "\n"
 				;
 			}
@@ -20015,7 +20069,7 @@ if (!$fields) {
 $table_status = table_status1($TABLE);
 $name = adminer()->tableName($table_status);
 
-page_header(($fields && is_view($table_status) ? $table_status['Engine'] == 'materialized view' ? lang(130) : lang(131) : lang(132)) . ": " . ($name != "" ? $name : h($TABLE)), $error);
+page_header(($fields && is_view($table_status) ? $table_status['Engine'] == 'materialized view' ? lang(131) : lang(132) : lang(133)) . ": " . ($name != "" ? $name : h($TABLE)), $error);
 
 $rights = array();
 foreach ($fields as $key => $field) {
@@ -20025,7 +20079,7 @@ adminer()->selectLinks($table_status, (isset($rights["insert"]) || !support("tab
 
 $comment = $table_status["Comment"];
 if ($comment != "") {
-	echo "<p class='nowrap'>" . lang(41) . ": " . h($comment) . "\n";
+	echo "<p class='nowrap'>" . lang(42) . ": " . h($comment) . "\n";
 }
 
 if ($fields) {
@@ -20033,38 +20087,39 @@ if ($fields) {
 }
 
 /** Print links to tables
-* @param list<string> $tables
+* @param list<array{table: string, ns: string}> $tables
 */
 function tables_links(array $tables) {
 	echo "<ul>\n";
-	foreach ($tables as $table) {
-		echo "<li><a href='" . h(ME . "table=" . urlencode($table)) . "'>" . h($table) . "</a>";
+	foreach ($tables as $row) {
+		$link = preg_replace('~ns=[^&]*~', "ns=" . urlencode($row["ns"]), ME);
+		echo "<li><a href='" . h($link . "table=" . urlencode($row["table"])) . "'>" . ($row["ns"] != $_GET["ns"] ? "<b>" . h($row["ns"]) . "</b>." : "") . h($row["table"]) . "</a>";
 	}
 	echo "</ul>\n";
 }
 
 $inherits = driver()->inheritsFrom($TABLE);
 if ($inherits) {
-	echo "<h3>" . lang(133) . "</h3>\n";
+	echo "<h3>" . lang(134) . "</h3>\n";
 	tables_links($inherits);
 }
 
 if (support("indexes") && driver()->supportsIndex($table_status)) {
-	echo "<h3 id='indexes'>" . lang(134) . "</h3>\n";
+	echo "<h3 id='indexes'>" . lang(135) . "</h3>\n";
 	$indexes = indexes($TABLE);
 	if ($indexes) {
 		adminer()->tableIndexesPrint($indexes, $table_status);
 	}
-	echo '<p class="links"><a href="' . h(ME) . 'indexes=' . urlencode($TABLE) . '">' . lang(135) . "</a>\n";
+	echo '<p class="links"><a href="' . h(ME) . 'indexes=' . urlencode($TABLE) . '">' . lang(136) . "</a>\n";
 }
 
 if (!is_view($table_status)) {
 	if (fk_support($table_status)) {
-		echo "<h3 id='foreign-keys'>" . lang(100) . "</h3>\n";
+		echo "<h3 id='foreign-keys'>" . lang(101) . "</h3>\n";
 		$foreign_keys = foreign_keys($TABLE);
 		if ($foreign_keys) {
 			echo "<table>\n";
-			echo "<thead><tr><th>" . lang(136) . "<td>" . lang(137) . "<td>" . lang(103) . "<td>" . lang(102) . "<td></thead>\n";
+			echo "<thead><tr><th>" . lang(137) . "<td>" . lang(138) . "<td>" . lang(104) . "<td>" . lang(103) . "<td></thead>\n";
 			foreach ($foreign_keys as $name => $foreign_key) {
 				echo "<tr title='" . h($name) . "'>";
 				echo "<th><i>" . implode("</i>, <i>", array_map('Adminer\h', $foreign_key["source"])) . "</i>";
@@ -20081,47 +20136,47 @@ if (!is_view($table_status)) {
 				echo "(<i>" . implode("</i>, <i>", array_map('Adminer\h', $foreign_key["target"])) . "</i>)";
 				echo "<td>" . h($foreign_key["on_delete"]);
 				echo "<td>" . h($foreign_key["on_update"]);
-				echo '<td><a href="' . h(ME . 'foreign=' . urlencode($TABLE) . '&name=' . urlencode($name)) . '">' . lang(138) . '</a>';
+				echo '<td><a href="' . h(ME . 'foreign=' . urlencode($TABLE) . '&name=' . urlencode($name)) . '">' . lang(139) . '</a>';
 				echo "\n";
 			}
 			echo "</table>\n";
 		}
-		echo '<p class="links"><a href="' . h(ME) . 'foreign=' . urlencode($TABLE) . '">' . lang(139) . "</a>\n";
+		echo '<p class="links"><a href="' . h(ME) . 'foreign=' . urlencode($TABLE) . '">' . lang(140) . "</a>\n";
 	}
 
 	if (support("check")) {
-		echo "<h3 id='checks'>" . lang(140) . "</h3>\n";
+		echo "<h3 id='checks'>" . lang(141) . "</h3>\n";
 		$check_constraints = driver()->checkConstraints($TABLE);
 		if ($check_constraints) {
 			echo "<table>\n";
 			foreach ($check_constraints as $key => $val) {
 				echo "<tr title='" . h($key) . "'>";
 				echo "<td><code class='jush-" . JUSH . "'>" . h($val);
-				echo "<td><a href='" . h(ME . 'check=' . urlencode($TABLE) . '&name=' . urlencode($key)) . "'>" . lang(138) . "</a>";
+				echo "<td><a href='" . h(ME . 'check=' . urlencode($TABLE) . '&name=' . urlencode($key)) . "'>" . lang(139) . "</a>";
 				echo "\n";
 			}
 			echo "</table>\n";
 		}
-		echo '<p class="links"><a href="' . h(ME) . 'check=' . urlencode($TABLE) . '">' . lang(141) . "</a>\n";
+		echo '<p class="links"><a href="' . h(ME) . 'check=' . urlencode($TABLE) . '">' . lang(142) . "</a>\n";
 	}
 }
 
 if (support(is_view($table_status) ? "view_trigger" : "trigger")) {
-	echo "<h3 id='triggers'>" . lang(142) . "</h3>\n";
+	echo "<h3 id='triggers'>" . lang(143) . "</h3>\n";
 	$triggers = triggers($TABLE);
 	if ($triggers) {
 		echo "<table>\n";
 		foreach ($triggers as $key => $val) {
-			echo "<tr valign='top'><td>" . h($val[0]) . "<td>" . h($val[1]) . "<th>" . h($key) . "<td><a href='" . h(ME . 'trigger=' . urlencode($TABLE) . '&name=' . urlencode($key)) . "'>" . lang(138) . "</a>\n";
+			echo "<tr valign='top'><td>" . h($val[0]) . "<td>" . h($val[1]) . "<th>" . h($key) . "<td><a href='" . h(ME . 'trigger=' . urlencode($TABLE) . '&name=' . urlencode($key)) . "'>" . lang(139) . "</a>\n";
 		}
 		echo "</table>\n";
 	}
-	echo '<p class="links"><a href="' . h(ME) . 'trigger=' . urlencode($TABLE) . '">' . lang(143) . "</a>\n";
+	echo '<p class="links"><a href="' . h(ME) . 'trigger=' . urlencode($TABLE) . '">' . lang(144) . "</a>\n";
 }
 
 $inherited = driver()->inheritedTables($TABLE);
 if ($inherited) {
-	echo "<h3 id='partitions'>" . lang(144) . "</h3>\n";
+	echo "<h3 id='partitions'>" . lang(145) . "</h3>\n";
 	$partition = driver()->partitionsInfo($TABLE);
 	if ($partition) {
 		echo "<p><code class='jush-" . JUSH . "'>BY " . h("$partition[partition_by]($partition[partition])") . "</code>\n";
@@ -20131,7 +20186,7 @@ if ($inherited) {
 
 } elseif (isset($_GET["schema"])) {
 	
-page_header(lang(61), "", array(), h(DB . ($_GET["ns"] ? ".$_GET[ns]" : "")));
+page_header(lang(62), "", array(), h(DB . ($_GET["ns"] ? ".$_GET[ns]" : "")));
 
 /** @var array{float, float}[] */
 $table_pos = array();
@@ -20248,7 +20303,7 @@ foreach ($schema as $name => $table) {
 }
 ?>
 </div>
-<p class="links"><a href="<?php echo h(ME . "schema=" . urlencode($SCHEMA)); ?>" id="schema-link"><?php echo lang(145); ?></a>
+<p class="links"><a href="<?php echo h(ME . "schema=" . urlencode($SCHEMA)); ?>" id="schema-link"><?php echo lang(146); ?></a>
 <?php
 } elseif (isset($_GET["dump"])) {
 	
@@ -20388,7 +20443,7 @@ SET foreign_key_checks = 0;
 	exit;
 }
 
-page_header(lang(67), $error, ($_GET["export"] != "" ? array("table" => $_GET["export"]) : array()), h(DB));
+page_header(lang(68), $error, ($_GET["export"] != "" ? array("table" => $_GET["export"]) : array()), h(DB));
 ?>
 
 <form action="" method="post">
@@ -20409,25 +20464,25 @@ if (!isset($row["events"])) { // backwards compatibility
 	$row["triggers"] = $row["table_style"];
 }
 
-echo "<tr><th>" . lang(146) . "<td>" . html_radios("output", adminer()->dumpOutput(), $row["output"]) . "\n";
+echo "<tr><th>" . lang(147) . "<td>" . html_radios("output", adminer()->dumpOutput(), $row["output"]) . "\n";
 
-echo "<tr><th>" . lang(147) . "<td>" . html_radios("format", adminer()->dumpFormat(), $row["format"]) . "\n";
+echo "<tr><th>" . lang(148) . "<td>" . html_radios("format", adminer()->dumpFormat(), $row["format"]) . "\n";
 
-echo (JUSH == "sqlite" ? "" : "<tr><th>" . lang(28) . "<td>" . html_select('db_style', $db_style, $row["db_style"])
+echo (JUSH == "sqlite" ? "" : "<tr><th>" . lang(29) . "<td>" . html_select('db_style', $db_style, $row["db_style"])
 	. (support("type") ? checkbox("types", 1, $row["types"], lang(6)) : "")
-	. (support("routine") ? checkbox("routines", 1, $row["routines"], lang(63)) : "")
-	. (support("event") ? checkbox("events", 1, $row["events"], lang(65)) : "")
+	. (support("routine") ? checkbox("routines", 1, $row["routines"], lang(64)) : "")
+	. (support("event") ? checkbox("events", 1, $row["events"], lang(66)) : "")
 );
 
-echo "<tr><th>" . lang(123) . "<td>" . html_select('table_style', $table_style, $row["table_style"])
-	. checkbox("auto_increment", 1, $row["auto_increment"], lang(42))
-	. (support("trigger") ? checkbox("triggers", 1, $row["triggers"], lang(142)) : "")
+echo "<tr><th>" . lang(124) . "<td>" . html_select('table_style', $table_style, $row["table_style"])
+	. checkbox("auto_increment", 1, $row["auto_increment"], lang(43))
+	. (support("trigger") ? checkbox("triggers", 1, $row["triggers"], lang(143)) : "")
 ;
 
-echo "<tr><th>" . lang(148) . "<td>" . html_select('data_style', $data_style, $row["data_style"]);
+echo "<tr><th>" . lang(149) . "<td>" . html_select('data_style', $data_style, $row["data_style"]);
 ?>
 </table>
-<p><input type="submit" value="<?php echo lang(67); ?>">
+<p><input type="submit" value="<?php echo lang(68); ?>">
 <?php echo input_token(); ?>
 
 <table>
@@ -20437,8 +20492,8 @@ $prefixes = array();
 if (DB != "") {
 	$checked = ($TABLE != "" ? "" : " checked");
 	echo "<thead><tr>";
-	echo "<th style='text-align: left;'><label class='block'><input type='checkbox' id='check-tables'$checked>" . lang(123) . "</label>" . script("qs('#check-tables').onclick = partial(formCheck, /^tables\\[/);", "");
-	echo "<th style='text-align: right;'><label class='block'>" . lang(148) . "<input type='checkbox' id='check-data'$checked></label>" . script("qs('#check-data').onclick = partial(formCheck, /^data\\[/);", "");
+	echo "<th style='text-align: left;'><label class='block'><input type='checkbox' id='check-tables'$checked>" . lang(124) . "</label>" . script("qs('#check-tables').onclick = partial(formCheck, /^tables\\[/);", "");
+	echo "<th style='text-align: right;'><label class='block'>" . lang(149) . "<input type='checkbox' id='check-data'$checked></label>" . script("qs('#check-data').onclick = partial(formCheck, /^data\\[/);", "");
 	echo "</thead>\n";
 
 	$views = "";
@@ -20462,7 +20517,7 @@ if (DB != "") {
 
 } else {
 	echo "<thead><tr><th style='text-align: left;'>";
-	echo "<label class='block'><input type='checkbox' id='check-databases'" . ($TABLE == "" ? " checked" : "") . ">" . lang(28) . "</label>";
+	echo "<label class='block'><input type='checkbox' id='check-databases'" . ($TABLE == "" ? " checked" : "") . ">" . lang(29) . "</label>";
 	echo script("qs('#check-databases').onclick = partial(formCheck, /^databases\\[/);", "");
 	echo "</thead>\n";
 	$databases = adminer()->databases();
@@ -20492,9 +20547,9 @@ foreach ($prefixes as $key => $val) {
 
 } elseif (isset($_GET["privileges"])) {
 	
-page_header(lang(62));
+page_header(lang(63));
 
-echo '<p class="links"><a href="' . h(ME) . 'user=">' . lang(149) . "</a>";
+echo '<p class="links"><a href="' . h(ME) . 'user=">' . lang(150) . "</a>";
 
 $result = connection()->query("SELECT User, Host FROM mysql." . (DB == "" ? "user" : "db WHERE " . q(DB) . " LIKE Db") . " ORDER BY Host, User");
 $grant = $result;
@@ -20508,7 +20563,7 @@ hidden_fields_get();
 echo input_hidden("db", DB);
 echo ($grant ? "" : input_hidden("grant"));
 echo "<table class='odds'>\n";
-echo "<thead><tr><th>" . lang(26) . "<th>" . lang(25) . "<th></thead>\n";
+echo "<thead><tr><th>" . lang(27) . "<th>" . lang(25) . "<th></thead>\n";
 
 while ($row = $result->fetch_assoc()) {
 	echo '<tr><td>' . h($row["User"]) . "<td>" . h($row["Host"]) . '<td><a href="' . h(ME . 'user=' . urlencode($row["User"]) . '&host=' . urlencode($row["Host"])) . '">' . lang(12) . "</a>\n";
@@ -20545,7 +20600,7 @@ if (!$error && $_POST["clear"]) {
 }
 stop_session();
 
-page_header((isset($_GET["import"]) ? lang(66) : lang(55)), $error);
+page_header((isset($_GET["import"]) ? lang(67) : lang(56)), $error);
 $line_comment = '--' . (JUSH == 'sql' ? ' ' : '');
 
 if (!$error && $_POST) {
@@ -20579,7 +20634,7 @@ if (!$error && $_POST) {
 		}
 
 		$space = "(?:\\s|/\\*[\s\S]*?\\*/|(?:#|$line_comment)[^\n]*\n?|--\r?\n)";
-		$delimiter = ";";
+		$delimiter = driver()->delimiter;
 		$offset = 0;
 		$empty = true;
 		$connection2 = connect(); // connection for exploring indexes and EXPLAIN (to not replace FOUND_ROWS()) //! PDO - silent error
@@ -20643,7 +20698,7 @@ if (!$error && $_POST) {
 						if (JUSH == "sqlite" && preg_match("~^$space*+ATTACH\\b~i", $q, $match)) {
 							// PHP doesn't support setting SQLITE_LIMIT_ATTACHED
 							echo $print;
-							echo "<p class='error'>" . lang(150) . "\n";
+							echo "<p class='error'>" . lang(151) . "\n";
 							$errors[] = " <a href='#sql-$commands'>$commands</a>";
 							if ($_POST["error_stops"]) {
 								break;
@@ -20665,7 +20720,7 @@ if (!$error && $_POST) {
 
 								if (connection()->error) {
 									echo ($_POST["only_errors"] ? $print : "");
-									echo "<p class='error'>" . lang(151) . (connection()->errno ? " (" . connection()->errno . ")" : "") . ": " . error() . "\n";
+									echo "<p class='error'>" . lang(152) . (connection()->errno ? " (" . connection()->errno . ")" : "") . ": " . error() . "\n";
 									$errors[] = " <a href='#sql-$commands'>$commands</a>";
 									if ($_POST["error_stops"]) {
 										break 2;
@@ -20679,7 +20734,7 @@ if (!$error && $_POST) {
 									$warnings = ($_POST["only_errors"] ? "" : driver()->warnings());
 									$warnings_id = "warnings-$commands";
 									if ($warnings) {
-										$time .= ", <a href='#$warnings_id'>" . lang(37) . "</a>" . script("qsl('a').onclick = partial(toggle, '$warnings_id');", "");
+										$time .= ", <a href='#$warnings_id'>" . lang(38) . "</a>" . script("qsl('a').onclick = partial(toggle, '$warnings_id');", "");
 									}
 									$explain = null;
 									$orgtables = null;
@@ -20690,17 +20745,17 @@ if (!$error && $_POST) {
 										if (!$_POST["only_errors"]) {
 											echo "<form action='' method='post'>\n";
 											$num_rows = $result->num_rows;
-											echo "<p class='sql-footer'>" . ($num_rows ? ($limit && $num_rows > $limit ? lang(152, $limit) : "") . lang(153, $num_rows) : "");
+											echo "<p class='sql-footer'>" . ($num_rows ? ($limit && $num_rows > $limit ? lang(153, $limit) : "") . lang(154, $num_rows) : "");
 											echo $time;
 											if ($connection2 && preg_match("~^($space|\\()*+SELECT\\b~i", $q) && ($explain = explain($connection2, $q))) {
 												echo ", <a href='#$explain_id'>Explain</a>" . script("qsl('a').onclick = partial(toggle, '$explain_id');", "");
 											}
 											$id = "export-$commands";
-											echo ", <a href='#$id'>" . lang(67) . "</a>" . script("qsl('a').onclick = partial(toggle, '$id');", "") . "<span id='$id' class='hidden'>: "
+											echo ", <a href='#$id'>" . lang(68) . "</a>" . script("qsl('a').onclick = partial(toggle, '$id');", "") . "<span id='$id' class='hidden'>: "
 												. html_select("output", adminer()->dumpOutput(), $adminer_export["output"]) . " "
 												. html_select("format", adminer()->dumpFormat(), $adminer_export["format"])
 												. input_hidden("query", $q)
-												. "<input type='submit' name='export' value='" . lang(67) . "'>" . input_token() . "</span>\n"
+												. "<input type='submit' name='export' value='" . lang(68) . "'>" . input_token() . "</span>\n"
 												. "</form>\n"
 											;
 										}
@@ -20712,7 +20767,7 @@ if (!$error && $_POST) {
 											stop_session();
 										}
 										if (!$_POST["only_errors"]) {
-											echo "<p class='message' title='" . h(connection()->info) . "'>" . lang(154, $affected) . "$time\n";
+											echo "<p class='message' title='" . h(connection()->info) . "'>" . lang(155, $affected) . "$time\n";
 										}
 									}
 									echo ($warnings ? "<div id='$warnings_id' class='hidden'>\n$warnings</div>\n" : "");
@@ -20736,12 +20791,12 @@ if (!$error && $_POST) {
 		}
 
 		if ($empty) {
-			echo "<p class='message'>" . lang(155) . "\n";
+			echo "<p class='message'>" . lang(156) . "\n";
 		} elseif ($_POST["only_errors"]) {
-			echo "<p class='message'>" . lang(156, $commands - count($errors));
+			echo "<p class='message'>" . lang(157, $commands - count($errors));
 			echo " <span class='time'>(" . format_time($total_start) . ")</span>\n";
 		} elseif ($errors && $commands > 1) {
-			echo "<p class='error'>" . lang(151) . ": " . implode("", $errors) . "\n";
+			echo "<p class='error'>" . lang(152) . ": " . implode("", $errors) . "\n";
 		}
 		//! MS SQL - SET SHOWPLAN_ALL OFF
 
@@ -20753,7 +20808,7 @@ if (!$error && $_POST) {
 
 <form action="" method="post" enctype="multipart/form-data" id="form">
 <?php
-$execute = "<input type='submit' value='" . lang(157) . "' title='Ctrl+Enter'>";
+$execute = "<input type='submit' value='" . lang(158) . "' title='Ctrl+Enter'>";
 if (!isset($_GET["import"])) {
 	$q = $_GET["sql"]; // overwrite $q from if ($_POST) to save memory
 	if ($_POST) {
@@ -20769,29 +20824,29 @@ if (!isset($_GET["import"])) {
 	echo "<p>";
 	adminer()->sqlPrintAfter();
 	echo "$execute\n";
-	echo lang(158) . ": <input type='number' name='limit' class='size' value='" . h($_POST ? $_POST["limit"] : $_GET["limit"]) . "'>\n";
+	echo lang(159) . ": <input type='number' name='limit' class='size' value='" . h($_POST ? $_POST["limit"] : $_GET["limit"]) . "'>\n";
 
 } else {
 	$gz = (extension_loaded("zlib") ? "[.gz]" : "");
-	echo "<fieldset><legend>" . lang(159) . "</legend><div>";
+	echo "<fieldset><legend>" . lang(160) . "</legend><div>";
 	echo file_input("SQL$gz: <input type='file' name='sql_file[]' multiple>\n$execute");
 	echo "</div></fieldset>\n";
 	$importServerPath = adminer()->importServerPath();
 	if ($importServerPath) {
-		echo "<fieldset><legend>" . lang(160) . "</legend><div>";
-		echo lang(161, "<code>" . h($importServerPath) . "$gz</code>");
-		echo ' <input type="submit" name="webfile" value="' . lang(162) . '">';
+		echo "<fieldset><legend>" . lang(161) . "</legend><div>";
+		echo lang(162, "<code>" . h($importServerPath) . "$gz</code>");
+		echo ' <input type="submit" name="webfile" value="' . lang(163) . '">';
 		echo "</div></fieldset>\n";
 	}
 	echo "<p>";
 }
 
-echo checkbox("error_stops", 1, ($_POST ? $_POST["error_stops"] : isset($_GET["import"]) || $_GET["error_stops"]), lang(163)) . "\n";
-echo checkbox("only_errors", 1, ($_POST ? $_POST["only_errors"] : isset($_GET["import"]) || $_GET["only_errors"]), lang(164)) . "\n";
+echo checkbox("error_stops", 1, ($_POST ? $_POST["error_stops"] : isset($_GET["import"]) || $_GET["error_stops"]), lang(164)) . "\n";
+echo checkbox("only_errors", 1, ($_POST ? $_POST["only_errors"] : isset($_GET["import"]) || $_GET["only_errors"]), lang(165)) . "\n";
 echo input_token();
 
 if (!isset($_GET["import"]) && $history) {
-	print_fieldset("history", lang(165), $_GET["history"] != "");
+	print_fieldset("history", lang(166), $_GET["history"] != "");
 	for ($val = end($history); $val; $val = prev($history)) { // not array_reverse() to save memory
 		$key = key($history);
 		list($q, $time, $elapsed) = $val;
@@ -20802,8 +20857,8 @@ if (!isset($_GET["import"]) && $history) {
 			. "<br>\n"
 		;
 	}
-	echo "<input type='submit' name='clear' value='" . lang(166) . "'>\n";
-	echo "<a href='" . h(ME . "sql=&history=all") . "'>" . lang(167) . "</a>\n";
+	echo "<input type='submit' name='clear' value='" . lang(167) . "'>\n";
+	echo "<a href='" . h(ME . "sql=&history=all") . "'>" . lang(168) . "</a>\n";
 	echo "</div></fieldset>\n";
 }
 ?>
@@ -20819,7 +20874,7 @@ $where = (isset($_GET["select"])
 );
 $update = (isset($_GET["select"]) ? $_POST["edit"] : $where);
 foreach ($fields as $name => $field) {
-	if (!isset($field["privileges"][$update ? "update" : "insert"]) || adminer()->fieldName($field) == "" || $field["generated"]) {
+	if ((!$update && !isset($field["privileges"]["insert"])) || adminer()->fieldName($field) == "") {
 		unset($fields[$name]);
 	}
 }
@@ -20839,7 +20894,7 @@ if ($_POST && !$error && !isset($_GET["select"])) {
 	if (isset($_POST["delete"])) {
 		queries_redirect(
 			$location,
-			lang(168),
+			lang(169),
 			driver()->delete($TABLE, $query_where, $unique_array ? 0 : 1)
 		);
 
@@ -20858,7 +20913,7 @@ if ($_POST && !$error && !isset($_GET["select"])) {
 			}
 			queries_redirect(
 				$location,
-				lang(169),
+				lang(170),
 				driver()->update($TABLE, $set, $query_where, $unique_array ? 0 : 1)
 			);
 			if (is_ajax()) {
@@ -20869,15 +20924,13 @@ if ($_POST && !$error && !isset($_GET["select"])) {
 		} else {
 			$result = driver()->insert($TABLE, $set);
 			$last_id = ($result ? last_id($result) : 0);
-			queries_redirect($location, lang(170, ($last_id ? " $last_id" : "")), $result); //! link
+			queries_redirect($location, lang(171, ($last_id ? " $last_id" : "")), $result); //! link
 		}
 	}
 }
 
 $row = null;
-if ($_POST["save"]) {
-	$row = (array) $_POST["fields"];
-} elseif ($where) {
+if ($where) {
 	$select = array();
 	foreach ($fields as $name => $field) {
 		if (isset($field["privileges"]["select"])) {
@@ -20923,6 +20976,10 @@ if (!support("table") && !$fields) { // used by Mongo and SimpleDB
 	}
 }
 
+if ($_POST["save"]) {
+	$row = (array) $_POST["fields"] + ($row ? $row : array());
+}
+
 edit_form($TABLE, $fields, $row, $update, $error);
 
 } elseif (isset($_GET["create"])) {
@@ -20959,7 +21016,7 @@ if ($_POST) {
 
 if ($_POST && !process_fields($row["fields"]) && !$error) {
 	if ($_POST["drop"]) {
-		queries_redirect(substr(ME, 0, -1), lang(171), drop_tables(array($TABLE)));
+		queries_redirect(substr(ME, 0, -1), lang(172), drop_tables(array($TABLE)));
 	} else {
 		$fields = array();
 		$all_fields = array();
@@ -21026,10 +21083,10 @@ if ($_POST && !process_fields($row["fields"]) && !$error) {
 			$partitioning = null;
 		}
 
-		$message = lang(172);
+		$message = lang(173);
 		if ($TABLE == "") {
 			cookie("adminer_engine", $row["Engine"]);
-			$message = lang(173);
+			$message = lang(174);
 		}
 		$name = trim($row["name"]);
 
@@ -21047,7 +21104,7 @@ if ($_POST && !process_fields($row["fields"]) && !$error) {
 	}
 }
 
-page_header(($TABLE != "" ? lang(34) : lang(68)), $error, array("table" => $TABLE), h($TABLE));
+page_header(($TABLE != "" ? lang(36) : lang(69)), $error, array("table" => $TABLE), h($TABLE));
 
 if (!$_POST) {
 	$types = driver()->types();
@@ -21095,11 +21152,11 @@ foreach ($engines as $engine) {
 <p>
 <?php
 if (support("columns") || $TABLE == "") {
-	echo lang(174) . ": <input name='name'" . ($TABLE == "" && !$_POST ? " autofocus" : "") . " data-maxlength='64' value='" . h($row["name"]) . "' autocapitalize='off'>\n";
-	echo ($engines ? html_select("Engine", array("" => "(" . lang(175) . ")") + $engines, $row["Engine"]) . on_help("event.target.value", 1) . script("qsl('select').onchange = helpClose;") . "\n" : "");
+	echo lang(175) . ": <input name='name'" . ($TABLE == "" && !$_POST ? " autofocus" : "") . " data-maxlength='64' value='" . h($row["name"]) . "' autocapitalize='off'>\n";
+	echo ($engines ? html_select("Engine", array("" => "(" . lang(176) . ")") + $engines, $row["Engine"]) . on_help("event.target.value", 1) . script("qsl('select').onchange = helpClose;") . "\n" : "");
 	if ($collations) {
 		echo "<datalist id='collations'>" . optionlist($collations) . "</datalist>\n";
-		echo (preg_match("~sqlite|mssql~", JUSH) ? "" : "<input list='collations' name='Collation' value='" . h($row["Collation"]) . "' placeholder='(" . lang(101) . ")'>\n");
+		echo (preg_match("~sqlite|mssql~", JUSH) ? "" : "<input list='collations' name='Collation' value='" . h($row["Collation"]) . "' placeholder='(" . lang(102) . ")'>\n");
 	}
 	echo "<input type='submit' value='" . lang(16) . "'>\n";
 }
@@ -21111,11 +21168,11 @@ if (support("columns")) {
 	echo "</table>\n";
 	echo script("editFields();");
 	echo "</div>\n<p>\n";
-	echo lang(42) . ": <input type='number' name='Auto_increment' class='size' value='" . h($row["Auto_increment"]) . "'>\n";
-	echo checkbox("defaults", 1, ($_POST ? $_POST["defaults"] : get_setting("defaults")), lang(176), "columnShow(this.checked, 5)", "jsonly");
+	echo lang(43) . ": <input type='number' name='Auto_increment' class='size' value='" . h($row["Auto_increment"]) . "'>\n";
+	echo checkbox("defaults", 1, ($_POST ? $_POST["defaults"] : get_setting("defaults")), lang(177), "columnShow(this.checked, 5)", "jsonly");
 	$comments = ($_POST ? $_POST["comments"] : get_setting("comments"));
 	echo (support("comment")
-		? checkbox("comments", 1, $comments, lang(41), "editingCommentsClick(this, true);", "jsonly")
+		? checkbox("comments", 1, $comments, lang(42), "editingCommentsClick(this, true);", "jsonly")
 			. ' ' . (preg_match('~\n~', $row["Comment"])
 				? "<textarea name='Comment' rows='2' cols='20'" . ($comments ? "" : " class='hidden'") . ">" . h($row["Comment"]) . "</textarea>"
 				: '<input name="Comment" value="' . h($row["Comment"]) . '" data-maxlength="' . (min_version(5.5) ? 2048 : 60) . '"' . ($comments ? "" : " class='hidden'") . '>'
@@ -21128,15 +21185,15 @@ if (support("columns")) {
 <?php } ?>
 
 <?php if ($TABLE != "") { ?>
-<input type="submit" name="drop" value="<?php echo lang(127); ?>"><?php echo confirm(lang(177, $TABLE));  } 
+<input type="submit" name="drop" value="<?php echo lang(128); ?>"><?php echo confirm(lang(178, $TABLE));  } 
 if ($partition_by && (JUSH == 'sql' || $TABLE == "")) {
 	$partition_table = preg_match('~RANGE|LIST~', $row["partition_by"]);
-	print_fieldset("partition", lang(178), $row["partition_by"]);
+	print_fieldset("partition", lang(179), $row["partition_by"]);
 	echo "<p>" . html_select("partition_by", array_merge(array(""), $partition_by), $row["partition_by"]) . on_help("event.target.value.replace(/./, 'PARTITION BY \$&')", 1) . script("qsl('select').onchange = partitionByChange;");
 	echo "(<input name='partition' value='" . h($row["partition"]) . "'>)\n";
-	echo lang(179) . ": <input type='number' name='partitions' class='size" . ($partition_table || !$row["partition_by"] ? " hidden" : "") . "' value='" . h($row["partitions"]) . "'>\n";
+	echo lang(180) . ": <input type='number' name='partitions' class='size" . ($partition_table || !$row["partition_by"] ? " hidden" : "") . "' value='" . h($row["partitions"]) . "'>\n";
 	echo "<table id='partition-table'" . ($partition_table ? "" : " class='hidden'") . ">\n";
-	echo "<thead><tr><th>" . lang(180) . "<th>" . lang(181) . "</thead>\n";
+	echo "<thead><tr><th>" . lang(181) . "<th>" . lang(182) . "</thead>\n";
 	foreach ($row["partition_names"] as $key => $val) {
 		echo '<tr>';
 		echo '<td><input name="partition_names[]" value="' . h($val) . '" autocapitalize="off">';
@@ -21227,10 +21284,10 @@ if ($_POST && !$error && !$_POST["add"] && !$_POST["drop_col"]) {
 	if (!$alter) {
 		redirect(ME . "table=" . urlencode($TABLE));
 	}
-	queries_redirect(ME . "table=" . urlencode($TABLE), lang(182), alter_indexes($TABLE, $alter));
+	queries_redirect(ME . "table=" . urlencode($TABLE), lang(183), alter_indexes($TABLE, $alter));
 }
 
-page_header(lang(134), $error, array("table" => $TABLE), h($TABLE));
+page_header(lang(135), $error, array("table" => $TABLE), h($TABLE));
 
 $fields_keys = array_keys($fields);
 if ($_POST["add"]) {
@@ -21260,10 +21317,10 @@ $show_options = ($_POST ? $_POST["options"] : get_setting("index_options"));
 <div class="scrollable">
 <table class="nowrap">
 <thead><tr>
-<th id="label-type"><?php echo lang(183); 
+<th id="label-type"><?php echo lang(184); 
 $idxopts = " class='idxopts" . ($show_options ? "" : " hidden") . "'";
 if ($index_algorithms) {
-	echo "<th id='label-algorithm'$idxopts>" . lang(184) . doc_link(array(
+	echo "<th id='label-algorithm'$idxopts>" . lang(185) . doc_link(array(
 		'sql' => 'create-index.html#create-index-storage-engine-index-types',
 		'mariadb' => 'storage-engine-index-types/',
 		
@@ -21271,24 +21328,24 @@ if ($index_algorithms) {
 }
 ?>
 <th><input type="submit" class="wayoff"><?php
-echo lang(185) . ($lengths ? "<span$idxopts> (" . lang(186) . ")</span>" : "");
+echo lang(186) . ($lengths ? "<span$idxopts> (" . lang(187) . ")</span>" : "");
 if ($lengths || support("descidx")) {
-	echo checkbox("options", 1, $show_options, lang(107), "indexOptionsShow(this.checked)", "jsonly") . "\n";
+	echo checkbox("options", 1, $show_options, lang(108), "indexOptionsShow(this.checked)", "jsonly") . "\n";
 }
 ?>
-<th id="label-name"><?php echo lang(187); 
+<th id="label-name"><?php echo lang(188); 
 if (support("partial_indexes")) {
-	echo "<th id='label-condition'$idxopts>" . lang(188);
+	echo "<th id='label-condition'$idxopts>" . lang(189);
 }
 ?>
-<th><noscript><?php echo icon("plus", "add[0]", "+", lang(108)); ?></noscript>
+<th><noscript><?php echo icon("plus", "add[0]", "+", lang(109)); ?></noscript>
 </thead>
 <?php
 if ($primary) {
 	echo "<tr><td>PRIMARY<td>";
 	foreach ($primary["columns"] as $key => $column) {
 		echo select_input(" disabled", $fields_keys, $column);
-		echo "<label><input disabled type='checkbox'>" . lang(50) . "</label> ";
+		echo "<label><input disabled type='checkbox'>" . lang(51) . "</label> ";
 	}
 	echo "<td><td>\n";
 }
@@ -21306,14 +21363,14 @@ foreach ($row["indexes"] as $index) {
 		$i = 1;
 		foreach ($index["columns"] as $key => $column) {
 			echo "<span>" . select_input(
-				" name='indexes[$j][columns][$i]' title='" . lang(39) . "'",
+				" name='indexes[$j][columns][$i]' title='" . lang(40) . "'",
 				($fields && ($column == "" || $fields[$column]) ? array_combine($fields_keys, $fields_keys) : array()),
 				$column,
 				"partial(" . ($i == count($index["columns"]) ? "indexesAddColumn" : "indexesChangeColumn") . ", '" . js_escape(JUSH == "sql" ? "" : $_GET["indexes"] . "_") . "')"
 			);
 			echo "<span$idxopts>";
-			echo ($lengths ? "<input type='number' name='indexes[$j][lengths][$i]' class='size' value='" . h(idx($index["lengths"], $key)) . "' title='" . lang(106) . "'>" : "");
-			echo (support("descidx") ? checkbox("indexes[$j][descs][$i]", 1, idx($index["descs"], $key), lang(50)) : "");
+			echo ($lengths ? "<input type='number' name='indexes[$j][lengths][$i]' class='size' value='" . h(idx($index["lengths"], $key)) . "' title='" . lang(107) . "'>" : "");
+			echo (support("descidx") ? checkbox("indexes[$j][descs][$i]", 1, idx($index["descs"], $key), lang(51)) : "");
 			echo "</span> </span>";
 			$i++;
 		}
@@ -21322,7 +21379,7 @@ foreach ($row["indexes"] as $index) {
 		if (support("partial_indexes")) {
 			echo "<td$idxopts><input name='indexes[$j][partial]' value='" . h($index["partial"]) . "' autocapitalize='off' aria-labelledby='label-condition'>\n";
 		}
-		echo "<td>" . icon("cross", "drop_col[$j]", "x", lang(111)) . script("qsl('button').onclick = partial(editingRemoveRow, 'indexes\$1[type]');");
+		echo "<td>" . icon("cross", "drop_col[$j]", "x", lang(112)) . script("qsl('button').onclick = partial(editingRemoveRow, 'indexes\$1[type]');");
 	}
 	$j++;
 }
@@ -21342,12 +21399,12 @@ if ($_POST && !$error && !$_POST["add"]) {
 	$name = trim($row["name"]);
 	if ($_POST["drop"]) {
 		$_GET["db"] = ""; // to save in global history
-		queries_redirect(remove_from_uri("db|database"), lang(189), drop_databases(array(DB)));
+		queries_redirect(remove_from_uri("db|database"), lang(190), drop_databases(array(DB)));
 	} elseif (DB !== $name) {
 		// create or rename database
 		if (DB != "") {
 			$_GET["db"] = $name;
-			queries_redirect(preg_replace('~\bdb=[^&]*&~', '', ME) . "db=" . urlencode($name), lang(190), rename_database($name, $row["collation"]));
+			queries_redirect(preg_replace('~\bdb=[^&]*&~', '', ME) . "db=" . urlencode($name), lang(191), rename_database($name, $row["collation"]));
 		} else {
 			$databases = explode("\n", str_replace("\r", "", $name));
 			$success = true;
@@ -21362,18 +21419,18 @@ if ($_POST && !$error && !$_POST["add"]) {
 			}
 			restart_session();
 			set_session("dbs", null);
-			queries_redirect(ME . "db=" . urlencode($last), lang(191), $success);
+			queries_redirect(ME . "db=" . urlencode($last), lang(192), $success);
 		}
 	} else {
 		// alter database
 		if (!$row["collation"]) {
 			redirect(substr(ME, 0, -1));
 		}
-		query_redirect("ALTER DATABASE " . idf_escape($name) . (preg_match('~^[a-z0-9_]+$~i', $row["collation"]) ? " COLLATE $row[collation]" : ""), substr(ME, 0, -1), lang(192));
+		query_redirect("ALTER DATABASE " . idf_escape($name) . (preg_match('~^[a-z0-9_]+$~i', $row["collation"]) ? " COLLATE $row[collation]" : ""), substr(ME, 0, -1), lang(193));
 	}
 }
 
-page_header(DB != "" ? lang(58) : lang(115), $error, array(), h(DB));
+page_header(DB != "" ? lang(59) : lang(116), $error, array(), h(DB));
 
 $collations = collations();
 $name = DB;
@@ -21398,7 +21455,7 @@ if ($_POST) {
 echo ($_POST["add"] || strpos($name, "\n")
 	? '<textarea autofocus name="name" rows="10" cols="40">' . h($name) . '</textarea><br>'
 	: '<input name="name" autofocus value="' . h($name) . '" data-maxlength="64" autocapitalize="off">'
-) . "\n" . ($collations ? html_select("collation", array("" => "(" . lang(101) . ")") + $collations, $row["collation"]) . doc_link(array(
+) . "\n" . ($collations ? html_select("collation", array("" => "(" . lang(102) . ")") + $collations, $row["collation"]) . doc_link(array(
 	'sql' => "charset-charsets.html",
 	'mariadb' => "supported-character-sets-and-collations/",
 	
@@ -21407,9 +21464,9 @@ echo ($_POST["add"] || strpos($name, "\n")
 <input type="submit" value="<?php echo lang(16); ?>">
 <?php
 if (DB != "") {
-	echo "<input type='submit' name='drop' value='" . lang(127) . "'>" . confirm(lang(177, DB)) . "\n";
+	echo "<input type='submit' name='drop' value='" . lang(128) . "'>" . confirm(lang(178, DB)) . "\n";
 } elseif (!$_POST["add"] && $_GET["db"] == "") {
-	echo icon("plus", "add[0]", "+", lang(108)) . "\n";
+	echo icon("plus", "add[0]", "+", lang(109)) . "\n";
 }
 echo input_token();
 ?>
@@ -21418,7 +21475,7 @@ echo input_token();
 } elseif (isset($_GET["call"])) {
 	
 $PROCEDURE = ($_GET["name"] ?: $_GET["call"]);
-page_header(lang(193) . ": " . h($PROCEDURE), $error);
+page_header(lang(194) . ": " . h($PROCEDURE), $error);
 
 $routine = routine($_GET["call"], (isset($_GET["callf"]) ? "FUNCTION" : "PROCEDURE"));
 $in = array();
@@ -21452,7 +21509,7 @@ if (!$error && $_POST) {
 		}
 	}
 
-	$query = (isset($_GET["callf"]) ? "SELECT " : "CALL ") . ($routine["returns"]["type"] == "record" ? "* FROM " : "") . table($PROCEDURE) . "(" . implode(", ", $call) . ")";
+	$query = (isset($_GET["callf"]) ? "SELECT " : "CALL ") . (idx($routine["returns"], "type") == "record" ? "* FROM " : "") . table($PROCEDURE) . "(" . implode(", ", $call) . ")";
 	$start = microtime(true);
 	$result = connection()->multi_query($query);
 	$affected = connection()->affected_rows; // getting warnings overwrites this
@@ -21471,7 +21528,7 @@ if (!$error && $_POST) {
 			if (is_object($result)) {
 				print_select_result($result, $connection2);
 			} else {
-				echo "<p class='message'>" . lang(194, $affected)
+				echo "<p class='message'>" . lang(195, $affected)
 					. " <span class='time'>" . @date("H:i:s") . "</span>\n" // @ - time zone may be not set
 				;
 			}
@@ -21505,7 +21562,7 @@ if ($in) {
 }
 ?>
 <p>
-<input type="submit" value="<?php echo lang(193); ?>">
+<input type="submit" value="<?php echo lang(194); ?>">
 <?php echo input_token(); ?>
 </form>
 
@@ -21563,15 +21620,15 @@ if ($_POST && !$error && !$_POST["add"] && !$_POST["change"] && !$_POST["change-
 	}
 	queries_redirect(
 		ME . "table=" . urlencode($TABLE),
-		($row["drop"] ? lang(195) : ($name != "" ? lang(196) : lang(197))),
+		($row["drop"] ? lang(196) : ($name != "" ? lang(197) : lang(198))),
 		$result
 	);
 	if (!$row["drop"]) {
-		$error = lang(198); //! no partitioning
+		$error = lang(199); //! no partitioning
 	}
 }
 
-page_header(lang(199), $error, array("table" => $TABLE), h($TABLE));
+page_header(lang(200), $error, array("table" => $TABLE), h($TABLE));
 
 if ($_POST) {
 	ksort($row["source"]);
@@ -21603,7 +21660,7 @@ if ($row["ns"] != "") {
 $referencable = array_keys(array_filter(table_status('', true), 'Adminer\fk_support'));
 $target = array_keys(fields(in_array($row["table"], $referencable) ? $row["table"] : reset($referencable)));
 $onchange = "this.form['change-js'].value = '1'; this.form.submit();";
-echo "<p><label>" . lang(200) . ": " . html_select("table", $referencable, $row["table"], $onchange) . "</label>\n";
+echo "<p><label>" . lang(201) . ": " . html_select("table", $referencable, $row["table"], $onchange) . "</label>\n";
 if (JUSH != "sqlite") {
 	$dbs = array();
 	foreach (adminer()->databases() as $db) {
@@ -21611,13 +21668,13 @@ if (JUSH != "sqlite") {
 			$dbs[] = $db;
 		}
 	}
-	echo "<label>" . lang(69) . ": " . html_select("db", $dbs, $row["db"] != "" ? $row["db"] : $_GET["db"], $onchange) . "</label>";
+	echo "<label>" . lang(70) . ": " . html_select("db", $dbs, $row["db"] != "" ? $row["db"] : $_GET["db"], $onchange) . "</label>";
 }
 echo input_hidden("change-js");
 ?>
-<noscript><p><input type="submit" name="change" value="<?php echo lang(201); ?>"></noscript>
+<noscript><p><input type="submit" name="change" value="<?php echo lang(202); ?>"></noscript>
 <table>
-<thead><tr><th id="label-source"><?php echo lang(136); ?><th id="label-target"><?php echo lang(137); ?></thead>
+<thead><tr><th id="label-source"><?php echo lang(137); ?><th id="label-target"><?php echo lang(138); ?></thead>
 <?php
 $j = 0;
 foreach ($row["source"] as $key => $val) {
@@ -21629,9 +21686,9 @@ foreach ($row["source"] as $key => $val) {
 ?>
 </table>
 <p>
-<label><?php echo lang(103); ?>: <?php echo html_select("on_delete", array(-1 => "") + explode("|", driver()->onActions), $row["on_delete"]); ?></label>
-<label><?php echo lang(102); ?>: <?php echo html_select("on_update", array(-1 => "") + explode("|", driver()->onActions), $row["on_update"]); ?></label>
-<?php echo doc_link(array(
+<label><?php echo lang(104); ?>: <?php echo html_select("on_delete", array(-1 => "") + explode("|", driver()->onActions), $row["on_delete"]); ?></label>
+<label><?php echo lang(103); ?>: <?php echo html_select("on_update", array(-1 => "") + explode("|", driver()->onActions), $row["on_update"]); ?></label>
+<?php echo (DRIVER === 'pgsql' ? html_select("deferrable", array('NOT DEFERRABLE', 'DEFERRABLE', 'DEFERRABLE INITIALLY DEFERRED'), $row["deferrable"]) . ' ' : '');  echo doc_link(array(
 	'sql' => "innodb-foreign-key-constraints.html",
 	'mariadb' => "foreign-keys/",
 	
@@ -21640,9 +21697,9 @@ foreach ($row["source"] as $key => $val) {
 )); ?>
 <p>
 <input type="submit" value="<?php echo lang(16); ?>">
-<noscript><p><input type="submit" name="add" value="<?php echo lang(202); ?>"></noscript>
+<noscript><p><input type="submit" name="add" value="<?php echo lang(203); ?>"></noscript>
 <?php if ($name != "") { ?>
-<input type="submit" name="drop" value="<?php echo lang(127); ?>"><?php echo confirm(lang(177, $name));  }  echo input_token(); ?>
+<input type="submit" name="drop" value="<?php echo lang(128); ?>"><?php echo confirm(lang(178, $name));  }  echo input_token(); ?>
 </form>
 <?php
 } elseif (isset($_GET["view"])) {
@@ -21659,7 +21716,7 @@ if ($_POST && !$error) {
 	$name = trim($row["name"]);
 	$as = " AS\n$row[select]";
 	$location = ME . "table=" . urlencode($name);
-	$message = lang(203);
+	$message = lang(204);
 
 	$type = ($_POST["materialized"] ? "MATERIALIZED VIEW" : "VIEW");
 
@@ -21674,9 +21731,9 @@ if ($_POST && !$error) {
 			"CREATE $type " . table($temp_name) . $as,
 			"DROP $type " . table($temp_name),
 			($_POST["drop"] ? substr(ME, 0, -1) : $location),
-			lang(204),
-			$message,
 			lang(205),
+			$message,
+			lang(206),
 			$TABLE,
 			$name
 		);
@@ -21692,17 +21749,17 @@ if (!$_POST && $TABLE != "") {
 	}
 }
 
-page_header(($TABLE != "" ? lang(35) : lang(206)), $error, array("table" => $TABLE), h($TABLE));
+page_header(($TABLE != "" ? lang(35) : lang(207)), $error, array("table" => $TABLE), h($TABLE));
 ?>
 
 <form action="" method="post">
-<p><?php echo lang(187); ?>: <input name="name" value="<?php echo h($row["name"]); ?>" data-maxlength="64" autocapitalize="off">
-<?php echo (support("materializedview") ? " " . checkbox("materialized", 1, $row["materialized"], lang(130)) : ""); ?>
+<p><?php echo lang(188); ?>: <input name="name" value="<?php echo h($row["name"]); ?>" data-maxlength="64" autocapitalize="off">
+<?php echo (support("materializedview") ? " " . checkbox("materialized", 1, $row["materialized"], lang(131)) : ""); ?>
 <p><?php textarea("select", $row["select"]); ?>
 <p>
 <input type="submit" value="<?php echo lang(16); ?>">
 <?php if ($TABLE != "") { ?>
-<input type="submit" name="drop" value="<?php echo lang(127); ?>"><?php echo confirm(lang(177, $TABLE));  }  echo input_token(); ?>
+<input type="submit" name="drop" value="<?php echo lang(128); ?>"><?php echo confirm(lang(178, $TABLE));  }  echo input_token(); ?>
 </form>
 <?php
 } elseif (isset($_GET["event"])) {
@@ -21714,7 +21771,7 @@ $row = $_POST;
 
 if ($_POST && !$error) {
 	if ($_POST["drop"]) {
-		query_redirect("DROP EVENT " . idf_escape($EVENT), substr(ME, 0, -1), lang(207));
+		query_redirect("DROP EVENT " . idf_escape($EVENT), substr(ME, 0, -1), lang(208));
 	} elseif (in_array($row["INTERVAL_FIELD"], $intervals) && isset($statuses[$row["STATUS"]])) {
 		$schedule = "\nON SCHEDULE " . ($row["INTERVAL_VALUE"]
 			? "EVERY " . q($row["INTERVAL_VALUE"]) . " $row[INTERVAL_FIELD]"
@@ -21726,7 +21783,7 @@ if ($_POST && !$error) {
 
 		queries_redirect(
 			substr(ME, 0, -1),
-			($EVENT != "" ? lang(208) : lang(209)),
+			($EVENT != "" ? lang(209) : lang(210)),
 			queries(
 				($EVENT != ""
 				? "ALTER EVENT " . idf_escape($EVENT) . $schedule . ($EVENT != $row["EVENT_NAME"] ? "\nRENAME TO " . idf_escape($row["EVENT_NAME"]) : "")
@@ -21738,7 +21795,7 @@ if ($_POST && !$error) {
 	}
 }
 
-page_header(($EVENT != "" ? lang(210) . ": " . h($EVENT) : lang(211)), $error);
+page_header(($EVENT != "" ? lang(211) . ": " . h($EVENT) : lang(212)), $error);
 
 if (!$row && $EVENT != "") {
 	$rows = get_rows("SELECT * FROM information_schema.EVENTS WHERE EVENT_SCHEMA = " . q(DB) . " AND EVENT_NAME = " . q($EVENT));
@@ -21748,19 +21805,19 @@ if (!$row && $EVENT != "") {
 
 <form action="" method="post">
 <table class="layout">
-<tr><th><?php echo lang(187); ?><td><input name="EVENT_NAME" value="<?php echo h($row["EVENT_NAME"]); ?>" data-maxlength="64" autocapitalize="off">
-<tr><th title="datetime"><?php echo lang(212); ?><td><input name="STARTS" value="<?php echo h("$row[EXECUTE_AT]$row[STARTS]"); ?>">
-<tr><th title="datetime"><?php echo lang(213); ?><td><input name="ENDS" value="<?php echo h($row["ENDS"]); ?>">
-<tr><th><?php echo lang(214); ?><td><input type="number" name="INTERVAL_VALUE" value="<?php echo h($row["INTERVAL_VALUE"]); ?>" class="size"> <?php echo html_select("INTERVAL_FIELD", $intervals, $row["INTERVAL_FIELD"]); ?>
-<tr><th><?php echo lang(118); ?><td><?php echo html_select("STATUS", $statuses, $row["STATUS"]); ?>
-<tr><th><?php echo lang(41); ?><td><input name="EVENT_COMMENT" value="<?php echo h($row["EVENT_COMMENT"]); ?>" data-maxlength="64">
-<tr><th><td><?php echo checkbox("ON_COMPLETION", "PRESERVE", $row["ON_COMPLETION"] == "PRESERVE", lang(215)); ?>
+<tr><th><?php echo lang(188); ?><td><input name="EVENT_NAME" value="<?php echo h($row["EVENT_NAME"]); ?>" data-maxlength="64" autocapitalize="off">
+<tr><th title="datetime"><?php echo lang(213); ?><td><input name="STARTS" value="<?php echo h("$row[EXECUTE_AT]$row[STARTS]"); ?>">
+<tr><th title="datetime"><?php echo lang(214); ?><td><input name="ENDS" value="<?php echo h($row["ENDS"]); ?>">
+<tr><th><?php echo lang(215); ?><td><input type="number" name="INTERVAL_VALUE" value="<?php echo h($row["INTERVAL_VALUE"]); ?>" class="size"> <?php echo html_select("INTERVAL_FIELD", $intervals, $row["INTERVAL_FIELD"]); ?>
+<tr><th><?php echo lang(119); ?><td><?php echo html_select("STATUS", $statuses, $row["STATUS"]); ?>
+<tr><th><?php echo lang(42); ?><td><input name="EVENT_COMMENT" value="<?php echo h($row["EVENT_COMMENT"]); ?>" data-maxlength="64">
+<tr><th><td><?php echo checkbox("ON_COMPLETION", "PRESERVE", $row["ON_COMPLETION"] == "PRESERVE", lang(216)); ?>
 </table>
 <p><?php textarea("EVENT_DEFINITION", $row["EVENT_DEFINITION"]); ?>
 <p>
 <input type="submit" value="<?php echo lang(16); ?>">
 <?php if ($EVENT != "") { ?>
-<input type="submit" name="drop" value="<?php echo lang(127); ?>"><?php echo confirm(lang(177, $EVENT));  }  echo input_token(); ?>
+<input type="submit" name="drop" value="<?php echo lang(128); ?>"><?php echo confirm(lang(178, $EVENT));  }  echo input_token(); ?>
 </form>
 <?php
 } elseif (isset($_GET["procedure"])) {
@@ -21785,15 +21842,15 @@ if ($_POST && !process_fields($row["fields"]) && !$error) {
 		create_routine($routine, array("name" => $temp_name) + $row),
 		"DROP $routine " . routine_id($temp_name, $row),
 		substr(ME, 0, -1),
-		lang(216),
 		lang(217),
 		lang(218),
+		lang(219),
 		$PROCEDURE,
 		$row["name"]
 	);
 }
 
-page_header(($PROCEDURE != "" ? (isset($_GET["function"]) ? lang(219) : lang(220)) . ": " . h($PROCEDURE) : (isset($_GET["function"]) ? lang(221) : lang(222))), $error);
+page_header(($PROCEDURE != "" ? (isset($_GET["function"]) ? lang(220) : lang(221)) . ": " . h($PROCEDURE) : (isset($_GET["function"]) ? lang(222) : lang(223))), $error);
 
 if (!$_POST) {
 	if ($PROCEDURE == "") {
@@ -21811,7 +21868,7 @@ echo ($collations ? "<datalist id='collations'>" . optionlist($collations) . "</
 ?>
 
 <form action="" method="post" id="form">
-<p><?php echo lang(187); ?>: <input name="name" value="<?php echo h($row["name"]); ?>" data-maxlength="64" autocapitalize="off">
+<p><?php echo lang(188); ?>: <input name="name" value="<?php echo h($row["name"]); ?>" data-maxlength="64" autocapitalize="off">
 <?php echo ($routine_languages ? "<label>" . lang(21) . ": " . html_select("language", $routine_languages, $row["language"]) . "</label>\n" : ""); ?>
 <input type="submit" value="<?php echo lang(16); ?>">
 <div class="scrollable">
@@ -21819,7 +21876,7 @@ echo ($collations ? "<datalist id='collations'>" . optionlist($collations) . "</
 <?php
 edit_fields($row["fields"], $collations, $routine);
 if (isset($_GET["function"])) {
-	echo "<tr><td>" . lang(223);
+	echo "<tr><td>" . lang(224);
 	edit_type("returns", (array) $row["returns"], $collations, array(), (JUSH == "pgsql" ? array("void", "trigger") : array()));
 }
 ?>
@@ -21830,7 +21887,7 @@ if (isset($_GET["function"])) {
 <p>
 <input type="submit" value="<?php echo lang(16); ?>">
 <?php if ($PROCEDURE != "") { ?>
-<input type="submit" name="drop" value="<?php echo lang(127); ?>"><?php echo confirm(lang(177, $PROCEDURE));  }  echo input_token(); ?>
+<input type="submit" name="drop" value="<?php echo lang(128); ?>"><?php echo confirm(lang(178, $PROCEDURE));  }  echo input_token(); ?>
 </form>
 <?php
 } elseif (isset($_GET["check"])) {
@@ -21850,12 +21907,12 @@ if ($row && !$error) {
 	}
 	queries_redirect(
 		ME . "table=" . urlencode($TABLE),
-		($row["drop"] ? lang(224) : ($name != "" ? lang(225) : lang(226))),
+		($row["drop"] ? lang(225) : ($name != "" ? lang(226) : lang(227))),
 		$result
 	);
 }
 
-page_header(($name != "" ? lang(227) . ": " . h($name) : lang(141)), $error, array("table" => $TABLE));
+page_header(($name != "" ? lang(228) . ": " . h($name) : lang(142)), $error, array("table" => $TABLE));
 
 if (!$row) {
 	$checks = driver()->checkConstraints($TABLE);
@@ -21866,7 +21923,7 @@ if (!$row) {
 <form action="" method="post">
 <p><?php
 if (JUSH != "sqlite") {
-	echo lang(187) . ': <input name="name" value="' . h($row["name"]) . '" data-maxlength="64" autocapitalize="off"> ';
+	echo lang(188) . ': <input name="name" value="' . h($row["name"]) . '" data-maxlength="64" autocapitalize="off"> ';
 }
 echo doc_link(array(
 	'sql' => "create-table-check-constraints.html",
@@ -21879,7 +21936,7 @@ echo doc_link(array(
 <p><?php textarea("clause", $row["clause"]); ?>
 <p><input type="submit" value="<?php echo lang(16); ?>">
 <?php if ($name != "") { ?>
-<input type="submit" name="drop" value="<?php echo lang(127); ?>"><?php echo confirm(lang(177, $name));  }  echo input_token(); ?>
+<input type="submit" name="drop" value="<?php echo lang(128); ?>"><?php echo confirm(lang(178, $name));  }  echo input_token(); ?>
 </form>
 <?php
 } elseif (isset($_GET["trigger"])) {
@@ -21896,14 +21953,14 @@ if ($_POST) {
 		$drop = "DROP TRIGGER " . idf_escape($name) . (JUSH == "pgsql" ? $on : "");
 		$location = ME . "table=" . urlencode($TABLE);
 		if ($_POST["drop"]) {
-			query_redirect($drop, $location, lang(228));
+			query_redirect($drop, $location, lang(229));
 		} else {
 			if ($name != "") {
 				queries($drop);
 			}
 			queries_redirect(
 				$location,
-				($name != "" ? lang(229) : lang(230)),
+				($name != "" ? lang(230) : lang(231)),
 				queries(create_trigger($on, $_POST))
 			);
 			if ($name != "") {
@@ -21914,22 +21971,22 @@ if ($_POST) {
 	$row = $_POST;
 }
 
-page_header(($name != "" ? lang(231) . ": " . h($name) : lang(232)), $error, array("table" => $TABLE));
+page_header(($name != "" ? lang(232) . ": " . h($name) : lang(233)), $error, array("table" => $TABLE));
 ?>
 
 <form action="" method="post" id="form">
 <table class="layout">
-<tr><th><?php echo lang(233); ?><td><?php echo html_select("Timing", $trigger_options["Timing"], $row["Timing"], "triggerChange(/^" . preg_quote($TABLE, "/") . "_[ba][iud]$/, '" . js_escape($TABLE) . "', this.form);"); ?>
-<tr><th><?php echo lang(234); ?><td><?php echo html_select("Event", $trigger_options["Event"], $row["Event"], "this.form['Timing'].onchange();");  echo (in_array("UPDATE OF", $trigger_options["Event"]) ? " <input name='Of' value='" . h($row["Of"]) . "' class='hidden'>": ""); ?>
-<tr><th><?php echo lang(40); ?><td><?php echo html_select("Type", $trigger_options["Type"], $row["Type"]); ?>
+<tr><th><?php echo lang(234); ?><td><?php echo html_select("Timing", $trigger_options["Timing"], $row["Timing"], "triggerChange(/^" . preg_quote($TABLE, "/") . "_[ba][iud]$/, '" . js_escape($TABLE) . "', this.form);"); ?>
+<tr><th><?php echo lang(235); ?><td><?php echo html_select("Event", $trigger_options["Event"], $row["Event"], "this.form['Timing'].onchange();");  echo (in_array("UPDATE OF", $trigger_options["Event"]) ? " <input name='Of' value='" . h($row["Of"]) . "' class='hidden'>": ""); ?>
+<tr><th><?php echo lang(41); ?><td><?php echo html_select("Type", $trigger_options["Type"], $row["Type"]); ?>
 </table>
-<p><?php echo lang(187); ?>: <input name="Trigger" value="<?php echo h($row["Trigger"]); ?>" data-maxlength="64" autocapitalize="off">
+<p><?php echo lang(188); ?>: <input name="Trigger" value="<?php echo h($row["Trigger"]); ?>" data-maxlength="64" autocapitalize="off">
 <?php echo script("qs('#form')['Timing'].onchange();"); ?>
 <p><?php textarea("Statement", $row["Statement"]); ?>
 <p>
 <input type="submit" value="<?php echo lang(16); ?>">
 <?php if ($name != "") { ?>
-<input type="submit" name="drop" value="<?php echo lang(127); ?>"><?php echo confirm(lang(177, $name));  }  echo input_token(); ?>
+<input type="submit" name="drop" value="<?php echo lang(128); ?>"><?php echo confirm(lang(178, $name));  }  echo input_token(); ?>
 </form>
 <?php
 } elseif (isset($_GET["user"])) {
@@ -21983,7 +22040,7 @@ if (isset($_GET["host"]) && ($result = connection()->query("SHOW GRANTS FOR " . 
 if ($_POST && !$error) {
 	$old_user = (isset($_GET["host"]) ? q($USER) . "@" . q($_GET["host"]) : "''");
 	if ($_POST["drop"]) {
-		query_redirect("DROP USER $old_user", ME . "privileges=", lang(235));
+		query_redirect("DROP USER $old_user", ME . "privileges=", lang(236));
 	} else {
 		$new_user = q($_POST["user"]) . "@" . q($_POST["host"]); // if $_GET["host"] is not set then $new_user is always different
 		$pass = $_POST["pass"];
@@ -22042,7 +22099,7 @@ if ($_POST && !$error) {
 			}
 		}
 
-		queries_redirect(ME . "privileges=", (isset($_GET["host"]) ? lang(236) : lang(237)), !$error);
+		queries_redirect(ME . "privileges=", (isset($_GET["host"]) ? lang(237) : lang(238)), !$error);
 
 		if ($created) {
 			// delete new user in case of an error
@@ -22051,7 +22108,7 @@ if ($_POST && !$error) {
 	}
 }
 
-page_header((isset($_GET["host"]) ? lang(26) . ": " . h("$USER@$_GET[host]") : lang(149)), $error, array("privileges" => array('', lang(62))));
+page_header((isset($_GET["host"]) ? lang(27) . ": " . h("$USER@$_GET[host]") : lang(150)), $error, array("privileges" => array('', lang(63))));
 
 $row = $_POST;
 if ($row) {
@@ -22069,15 +22126,15 @@ if ($row) {
 <form action="" method="post">
 <table class="layout">
 <tr><th><?php echo lang(25); ?><td><input name="host" data-maxlength="60" value="<?php echo h($row["host"]); ?>" autocapitalize="off">
-<tr><th><?php echo lang(26); ?><td><input name="user" data-maxlength="80" value="<?php echo h($row["user"]); ?>" autocapitalize="off">
-<tr><th><?php echo lang(27); ?><td><input name="pass" id="pass" value="<?php echo h($row["pass"]); ?>" autocomplete="new-password">
-<?php echo ($row["hashed"] ? "" : script("typePassword(qs('#pass'));"));  echo (min_version(8) ? "" : checkbox("hashed", 1, $row["hashed"], lang(238), "typePassword(this.form['pass'], this.checked);")); ?>
+<tr><th><?php echo lang(27); ?><td><input name="user" data-maxlength="80" value="<?php echo h($row["user"]); ?>" autocapitalize="off">
+<tr><th><?php echo lang(28); ?><td><input name="pass" id="pass" value="<?php echo h($row["pass"]); ?>" autocomplete="new-password">
+<?php echo ($row["hashed"] ? "" : script("typePassword(qs('#pass'));"));  echo (min_version(8) ? "" : checkbox("hashed", 1, $row["hashed"], lang(239), "typePassword(this.form['pass'], this.checked);")); ?>
 </table>
 
 <?php
 //! MAX_* limits, REQUIRE
 echo "<table class='odds'>\n";
-echo "<thead><tr><th colspan='2'>" . lang(62) . doc_link(array('sql' => "grant.html#priv_level"));
+echo "<thead><tr><th colspan='2'>" . lang(63) . doc_link(array('sql' => "grant.html#priv_level"));
 $i = 0;
 foreach ($grants as $object => $grant) {
 	echo '<th>' . ($object != "*.*"
@@ -22092,10 +22149,10 @@ foreach (
 	array(
 		"" => "",
 		"Server Admin" => lang(25),
-		"Databases" => lang(28),
-		"Tables" => lang(132),
-		"Columns" => lang(39),
-		"Procedures" => lang(239),
+		"Databases" => lang(29),
+		"Tables" => lang(133),
+		"Columns" => lang(40),
+		"Procedures" => lang(240),
 	) as $context => $desc
 ) {
 	foreach ((array) $privileges[$context] as $privilege => $comment) {
@@ -22107,7 +22164,7 @@ foreach (
 			if ($context == "Server Admin" && $object != (isset($grants["*.*"]) ? "*.*" : ".*")) {
 				echo "<td>";
 			} elseif (isset($_GET["grant"])) {
-				echo "<td><select name=$name><option><option value='1'" . ($value ? " selected" : "") . ">" . lang(240) . "<option value='0'" . ($value == "0" ? " selected" : "") . ">" . lang(241) . "</select>";
+				echo "<td><select name=$name><option><option value='1'" . ($value ? " selected" : "") . ">" . lang(241) . "<option value='0'" . ($value == "0" ? " selected" : "") . ">" . lang(242) . "</select>";
 			} else {
 				echo "<td align='center'><label class='block'>";
 				echo "<input type='checkbox' name=$name value='1'" . ($value ? " checked" : "") . ($privilege == "All privileges"
@@ -22125,7 +22182,7 @@ echo "</table>\n";
 <p>
 <input type="submit" value="<?php echo lang(16); ?>">
 <?php if (isset($_GET["host"])) { ?>
-<input type="submit" name="drop" value="<?php echo lang(127); ?>"><?php echo confirm(lang(177, "$USER@$_GET[host]"));  }  echo input_token(); ?>
+<input type="submit" name="drop" value="<?php echo lang(128); ?>"><?php echo confirm(lang(178, "$USER@$_GET[host]"));  }  echo input_token(); ?>
 </form>
 <?php
 } elseif (isset($_GET["processlist"])) {
@@ -22138,11 +22195,11 @@ if (support("kill")) {
 				$killed++;
 			}
 		}
-		queries_redirect(ME . "processlist=", lang(242, $killed), $killed || !$_POST["kill"]);
+		queries_redirect(ME . "processlist=", lang(243, $killed), $killed || !$_POST["kill"]);
 	}
 }
 
-page_header(lang(116), $error);
+page_header(lang(117), $error);
 ?>
 
 <form action="" method="post">
@@ -22170,7 +22227,7 @@ foreach (adminer()->processList() as $i => $row) {
 			(JUSH == "sql" && $key == "Info" && preg_match("~Query|Killed~", $row["Command"]) && $val != "") ||
 			(JUSH == "pgsql" && $key == "current_query" && $val != "<IDLE>") ||
 			(JUSH == "oracle" && $key == "sql_text" && $val != "")
-			? "<code class='jush-" . JUSH . "'>" . shorten_utf8($val, 100, "</code>") . ' <a href="' . h(ME . ($row["db"] != "" ? "db=" . urlencode($row["db"]) . "&" : "") . "sql=" . urlencode($val)) . '">' . lang(243) . '</a>'
+			? "<code class='jush-" . JUSH . "'>" . shorten_utf8($val, 100, "</code>") . ' <a href="' . h(ME . ($row["db"] != "" ? "db=" . urlencode($row["db"]) . "&" : "") . "sql=" . urlencode($val)) . '">' . lang(244) . '</a>'
 			: h($val)
 		);
 	}
@@ -22182,8 +22239,8 @@ foreach (adminer()->processList() as $i => $row) {
 <p>
 <?php
 if (support("kill")) {
-	echo ($i + 1) . "/" . lang(244, max_connections());
-	echo "<p><input type='submit' value='" . lang(245) . "'>\n";
+	echo ($i + 1) . "/" . lang(245, max_connections());
+	echo "<p><input type='submit' value='" . lang(246) . "'>\n";
 }
 echo input_token();
 ?>
@@ -22339,11 +22396,11 @@ if ($_POST && !$error) {
 					}
 				}
 			}
-			$message = lang(246, $affected);
+			$message = lang(247, $affected);
 			if ($_POST["clone"] && $result && $affected == 1) {
 				$last_id = last_id($result);
 				if ($last_id) {
-					$message = lang(170, " $last_id");
+					$message = lang(171, " $last_id");
 				}
 			}
 			queries_redirect(remove_from_uri($_POST["all"] && $_POST["delete"] ? "page" : ""), $message, $result);
@@ -22356,7 +22413,7 @@ if ($_POST && !$error) {
 
 		} elseif (!$_POST["import"]) { // modify
 			if (!$_POST["val"]) {
-				$error = lang(247);
+				$error = lang(248);
 			} else {
 				$result = true;
 				$affected = 0;
@@ -22378,13 +22435,13 @@ if ($_POST && !$error) {
 					}
 					$affected += connection()->affected_rows;
 				}
-				queries_redirect(remove_from_uri(), lang(246, $affected), $result);
+				queries_redirect(remove_from_uri(), lang(247, $affected), $result);
 			}
 
 		} elseif (!is_string($file = get_file("csv_file", true))) {
 			$error = upload_error($file);
 		} elseif (!preg_match('~~u', $file)) {
-			$error = lang(248);
+			$error = lang(249);
 		} else {
 			save_settings(array("output" => $adminer_import["output"], "format" => $_POST["separator"]), "adminer_import");
 			$result = true;
@@ -22412,7 +22469,7 @@ if ($_POST && !$error) {
 			if ($result) {
 				driver()->commit();
 			}
-			queries_redirect(remove_from_uri("page"), lang(249, $affected), $result);
+			queries_redirect(remove_from_uri("page"), lang(250, $affected), $result);
 			driver()->rollback(); // after queries_redirect() to not overwrite error
 
 		}
@@ -22424,7 +22481,7 @@ if (is_ajax()) {
 	page_headers();
 	ob_start();
 } else {
-	page_header(lang(44) . ": $table_name", $error);
+	page_header(lang(45) . ": $table_name", $error);
 }
 
 $set = null;
@@ -22444,7 +22501,7 @@ if (isset($rights["insert"]) || !support("table")) {
 adminer()->selectLinks($table_status, $set);
 
 if (!$columns && support("table")) {
-	echo "<p class='error'>" . lang(250) . ($fields ? "." : ": " . error()) . "\n";
+	echo "<p class='error'>" . lang(251) . ($fields ? "." : ": " . error()) . "\n";
 } else {
 	echo "<form action='' id='form'>\n";
 	echo "<div style='display: none;'>";
@@ -22524,7 +22581,7 @@ if (!$columns && support("table")) {
 			echo "<thead><tr>" . (!$group && $select
 				? ""
 				: "<td><input type='checkbox' id='all-page' class='jsonly'>" . script("qs('#all-page').onclick = partial(formCheck, /check/);", "")
-					. " <a href='" . h($_GET["modify"] ? remove_from_uri("modify") : $_SERVER["REQUEST_URI"] . "&modify=1") . "'>" . lang(251) . "</a>");
+					. " <a href='" . h($_GET["modify"] ? remove_from_uri("modify") : $_SERVER["REQUEST_URI"] . "&modify=1") . "'>" . lang(252) . "</a>");
 			$names = array();
 			$functions = array();
 			reset($select);
@@ -22543,17 +22600,14 @@ if (!$columns && support("table")) {
 						$desc = "&desc%5B0%5D=1";
 						echo "<th id='th[" . h(bracket_escape($key)) . "]'>" . script("mixin(qsl('th'), {onmouseover: partial(columnMouse), onmouseout: partial(columnMouse, ' hidden')});", "");
 						$fun = apply_sql_function($val["fun"], $name); //! columns looking like functions
-						$sortable = isset($field["privileges"]["order"]) || $fun;
+						$sortable = isset($field["privileges"]["order"]) || $fun != $name;
 						echo ($sortable ? "<a href='" . h($href . ($order[0] == $column || $order[0] == $key ? $desc : '')) . "'>$fun</a>" : $fun); // $order[0] == $key - COUNT(*)
-						echo "<span class='column hidden'>";
-						if ($sortable) {
-							echo "<a href='" . h($href . $desc) . "' title='" . lang(50) . "' class='text'> ↓</a>";
-						}
+						$menu = ($sortable ? "<a href='" . h($href . $desc) . "' title='" . lang(51) . "' class='text'> ↓</a>" : '');
 						if (!$val["fun"] && isset($field["privileges"]["where"])) {
-							echo '<a href="#fieldset-search" title="' . lang(47) . '" class="text jsonly"> =</a>';
-							echo script("qsl('a').onclick = partial(selectSearch, '" . js_escape($key) . "');");
+							$menu .= '<a href="#fieldset-search" title="' . lang(48) . '" class="text jsonly"> =</a>';
+							$menu .= script("qsl('a').onclick = partial(selectSearch, '" . js_escape($key) . "');");
 						}
-						echo "</span>";
+						echo ($menu ? "<span class='column hidden'>$menu</span>" : "");
 					}
 					$functions[$key] = $val["fun"];
 					next($select);
@@ -22569,7 +22623,7 @@ if (!$columns && support("table")) {
 				}
 			}
 
-			echo ($backward_keys ? "<th>" . lang(252) : "") . "</thead>\n";
+			echo ($backward_keys ? "<th>" . lang(253) : "") . "</thead>\n";
 
 			if (is_ajax()) {
 				ob_end_clean();
@@ -22599,7 +22653,7 @@ if (!$columns && support("table")) {
 				}
 				echo "<tr>" . (!$group && $select ? "" : "<td>"
 					. checkbox("check[]", substr($unique_idf, 1), in_array(substr($unique_idf, 1), (array) $_POST["check"]))
-					. ($is_group || information_schema(DB) ? "" : " <a href='" . h(ME . "edit=" . urlencode($TABLE) . $unique_idf) . "' class='edit'>" . lang(253) . "</a>")
+					. ($is_group || information_schema(DB) ? "" : " <a href='" . h(ME . "edit=" . urlencode($TABLE) . $unique_idf) . "' class='edit'>" . lang(254) . "</a>")
 				);
 
 				reset($select);
@@ -22607,7 +22661,6 @@ if (!$columns && support("table")) {
 					if (isset($names[$key])) {
 						$column = current($select);
 						$field = (array) $fields[$key];
-						$val = driver()->value($val, $field);
 						if ($val != "" && (!isset($email_fields[$key]) || $email_fields[$key] != "")) {
 							$email_fields[$key] = (is_mail($val) ? $names[$key] : ""); //! filled e-mails can be contained on other pages
 						}
@@ -22660,7 +22713,7 @@ if (!$columns && support("table")) {
 						} else {
 							$long = strpos($html, "<i>…</i>");
 							echo " data-text='" . ($long ? 2 : ($text ? 1 : 0)) . "'"
-								. ($editable ? "" : " data-warning='" . h(lang(254)) . "'")
+								. ($editable ? "" : " data-warning='" . h(lang(255)) . "'")
 								. ">$html"
 							;
 						}
@@ -22693,7 +22746,7 @@ if (!$columns && support("table")) {
 						if (intval($found_rows) < max(1e4, 2 * ($page + 1) * $limit)) {
 							// slow with big tables
 							$found_rows = first(slow_query(count_rows($TABLE, $where, $is_group, $group)));
-						} else {
+						} elseif (JUSH == 'sql' || JUSH == 'pgsql') {
 							$exact_count = false;
 						}
 					}
@@ -22702,8 +22755,8 @@ if (!$columns && support("table")) {
 				$pagination = ($limit && ($found_rows === false || $found_rows > $limit || $page));
 				if ($pagination) {
 					echo (($found_rows === false ? count($rows) + 1 : $found_rows - $page * $limit) > $limit
-						? '<p><a href="' . h(remove_from_uri("page") . "&page=" . ($page + 1)) . '" class="loadmore">' . lang(255) . '</a>'
-							. script("qsl('a').onclick = partial(selectLoadMore, $limit, '" . lang(256) . "…');", "")
+						? '<p><a href="' . h(remove_from_uri("page") . "&page=" . ($page + 1)) . '" class="loadmore">' . lang(256) . '</a>'
+							. script("qsl('a').onclick = partial(selectLoadMore, $limit, '" . lang(257) . "…');", "")
 						: ''
 					);
 					echo "\n";
@@ -22718,8 +22771,8 @@ if (!$columns && support("table")) {
 					);
 					echo "<fieldset>";
 					if (JUSH != "simpledb") {
-						echo "<legend><a href='" . h(remove_from_uri("page")) . "'>" . lang(257) . "</a></legend>";
-						echo script("qsl('a').onclick = function () { pageClick(this.href, +prompt('" . lang(257) . "', '" . ($page + 1) . "')); return false; };");
+						echo "<legend><a href='" . h(remove_from_uri("page")) . "'>" . lang(258) . "</a></legend>";
+						echo script("qsl('a').onclick = function () { pageClick(this.href, +prompt('" . lang(258) . "', '" . ($page + 1) . "')); return false; };");
 						echo pagination(0, $page) . ($page > 5 ? " …" : "");
 						for ($i = max(1, $page - 4); $i < min($max_page, $page + 5); $i++) {
 							echo pagination($i, $page);
@@ -22728,11 +22781,11 @@ if (!$columns && support("table")) {
 							echo ($page + 5 < $max_page ? " …" : "");
 							echo ($exact_count && $found_rows !== false
 								? pagination($max_page, $page)
-								: " <a href='" . h(remove_from_uri("page") . "&page=last") . "' title='~$max_page'>" . lang(258) . "</a>"
+								: " <a href='" . h(remove_from_uri("page") . "&page=last") . "' title='~$max_page'>" . lang(259) . "</a>"
 							);
 						}
 					} else {
-						echo "<legend>" . lang(257) . "</legend>";
+						echo "<legend>" . lang(258) . "</legend>";
 						echo pagination(0, $page) . ($page > 1 ? " …" : "");
 						echo ($page ? pagination($page, $page) : "");
 						echo ($max_page > $page ? pagination($page + 1, $page) . ($max_page > $page + 1 ? " …" : "") : "");
@@ -22741,20 +22794,20 @@ if (!$columns && support("table")) {
 				}
 
 				echo "<fieldset>";
-				echo "<legend>" . lang(259) . "</legend>";
+				echo "<legend>" . lang(260) . "</legend>";
 				$display_rows = ($exact_count ? "" : "~ ") . $found_rows;
 				$onclick = "const checked = formChecked(this, /check/); selectCount('selected', this.checked ? '$display_rows' : checked); selectCount('selected2', this.checked || !checked ? '$display_rows' : checked);";
-				echo checkbox("all", 1, 0, ($found_rows !== false ? ($exact_count ? "" : "~ ") . lang(153, $found_rows) : ""), $onclick) . "\n";
+				echo checkbox("all", 1, 0, ($found_rows !== false ? ($exact_count ? "" : "~ ") . lang(154, $found_rows) : ""), $onclick) . "\n";
 				echo "</fieldset>\n";
 
 				if (adminer()->selectCommandPrint()) {
 					?>
-<fieldset<?php echo ($_GET["modify"] ? '' : ' class="jsonly"'); ?>><legend><?php echo lang(251); ?></legend><div>
-<input type="submit" value="<?php echo lang(16); ?>"<?php echo ($_GET["modify"] ? '' : ' title="' . lang(247) . '"'); ?>>
+<fieldset<?php echo ($_GET["modify"] ? '' : ' class="jsonly"'); ?>><legend><?php echo lang(252); ?></legend><div>
+<input type="submit" value="<?php echo lang(16); ?>"<?php echo ($_GET["modify"] ? '' : ' title="' . lang(248) . '"'); ?>>
 </div></fieldset>
-<fieldset><legend><?php echo lang(126); ?> <span id="selected"></span></legend><div>
+<fieldset><legend><?php echo lang(127); ?> <span id="selected"></span></legend><div>
 <input type="submit" name="edit" value="<?php echo lang(12); ?>">
-<input type="submit" name="clone" value="<?php echo lang(243); ?>">
+<input type="submit" name="clone" value="<?php echo lang(244); ?>">
 <input type="submit" name="delete" value="<?php echo lang(20); ?>"><?php echo confirm(); ?>
 </div></fieldset>
 <?php
@@ -22768,11 +22821,11 @@ if (!$columns && support("table")) {
 					}
 				}
 				if ($format) {
-					print_fieldset("export", lang(67) . " <span id='selected2'></span>");
+					print_fieldset("export", lang(68) . " <span id='selected2'></span>");
 					$output = adminer()->dumpOutput();
 					echo ($output ? html_select("output", $output, $adminer_import["output"]) . " " : "");
 					echo html_select("format", $format, $adminer_import["format"]);
-					echo " <input type='submit' name='export' value='" . lang(67) . "'>\n";
+					echo " <input type='submit' name='export' value='" . lang(68) . "'>\n";
 					echo "</div></fieldset>\n";
 				}
 
@@ -22782,12 +22835,12 @@ if (!$columns && support("table")) {
 
 			if (adminer()->selectImportPrint()) {
 				echo "<p>";
-				echo "<a href='#import'>" . lang(66) . "</a>";
+				echo "<a href='#import'>" . lang(67) . "</a>";
 				echo script("qsl('a').onclick = partial(toggle, 'import');", "");
 				echo "<span id='import'" . ($_POST["import"] ? "" : " class='hidden'") . ">: ";
 				echo file_input("<input type='file' name='csv_file'> "
 					. html_select("separator", array("csv" => "CSV,", "csv;" => "CSV;", "tsv" => "TSV"), $adminer_import["format"])
-					. " <input type='submit' name='import' value='" . lang(66) . "'>")
+					. " <input type='submit' name='import' value='" . lang(67) . "'>")
 				;
 				echo "</span>";
 			}
@@ -22807,9 +22860,9 @@ if (is_ajax()) {
 } elseif (isset($_GET["variables"])) {
 	
 $status = isset($_GET["status"]);
-page_header($status ? lang(118) : lang(117));
+page_header($status ? lang(119) : lang(118));
 
-$variables = ($status ? show_status() : show_variables());
+$variables = ($status ? adminer()->showStatus() : adminer()->showVariables());
 if (!$variables) {
 	echo "<p class='message'>" . lang(14) . "\n";
 } else {
@@ -22889,13 +22942,13 @@ if ($tables_views && !$error && !$_POST["search"]) {
 		if ($_POST["tables"]) {
 			$result = truncate_tables($_POST["tables"]);
 		}
-		$message = lang(260);
+		$message = lang(261);
 	} elseif ($_POST["move"]) {
 		$result = move_tables((array) $_POST["tables"], (array) $_POST["views"], $_POST["target"]);
-		$message = lang(261);
+		$message = lang(262);
 	} elseif ($_POST["copy"]) {
 		$result = copy_tables((array) $_POST["tables"], (array) $_POST["views"], $_POST["target"]);
-		$message = lang(262);
+		$message = lang(263);
 	} elseif ($_POST["drop"]) {
 		if ($_POST["views"]) {
 			$result = drop_views($_POST["views"]);
@@ -22903,7 +22956,7 @@ if ($tables_views && !$error && !$_POST["search"]) {
 		if ($result && $_POST["tables"]) {
 			$result = drop_tables($_POST["tables"]);
 		}
-		$message = lang(263);
+		$message = lang(264);
 	} elseif (JUSH == "sqlite" && $_POST["check"]) {
 		foreach ((array) $_POST["tables"] as $table) {
 			foreach (get_rows("PRAGMA integrity_check(" . q($table) . ")") as $row) {
@@ -22915,7 +22968,7 @@ if ($tables_views && !$error && !$_POST["search"]) {
 			? queries("VACUUM")
 			: apply_queries("VACUUM" . ($_POST["optimize"] ? "" : " ANALYZE"), $_POST["tables"])
 		);
-		$message = lang(264);
+		$message = lang(265);
 	} elseif (!$_POST["tables"]) {
 		$message = lang(11);
 	} elseif ($result = queries(($_POST["optimize"] ? "OPTIMIZE" : ($_POST["check"] ? "CHECK" : ($_POST["repair"] ? "REPAIR" : "ANALYZE"))) . " TABLE " . implode(", ", array_map('Adminer\idf_escape', $_POST["tables"])))) {
@@ -22927,22 +22980,22 @@ if ($tables_views && !$error && !$_POST["search"]) {
 	queries_redirect(substr(ME, 0, -1), $message, $result);
 }
 
-page_header(($_GET["ns"] == "" ? lang(28) . ": " . h(DB) : lang(265) . ": " . h($_GET["ns"])), $error, true);
+page_header(($_GET["ns"] == "" ? lang(29) . ": " . h(DB) : lang(266) . ": " . h($_GET["ns"])), $error, true);
 
 if (adminer()->homepage()) {
 	if ($_GET["ns"] !== "") {
-		echo "<h3 id='tables-views'>" . lang(266) . "</h3>\n";
+		echo "<h3 id='tables-views'>" . lang(267) . "</h3>\n";
 		$tables_list = tables_list();
 		if (!$tables_list) {
 			echo "<p class='message'>" . lang(11) . "\n";
 		} else {
 			echo "<form action='' method='post'>\n";
 			if (support("table")) {
-				echo "<fieldset><legend>" . lang(267) . " <span id='selected2'></span></legend><div>";
+				echo "<fieldset><legend>" . lang(268) . " <span id='selected2'></span></legend><div>";
 				echo html_select("op", adminer()->operators(), idx($_POST, "op", JUSH == "elastic" ? "should" : "LIKE %%"));
 				echo " <input type='search' name='query' value='" . h($_POST["query"]) . "'>";
 				echo script("qsl('input').onkeydown = partialArg(bodyKeydown, 'search');", "");
-				echo " <input type='submit' name='search' value='" . lang(47) . "'>\n";
+				echo " <input type='submit' name='search' value='" . lang(48) . "'>\n";
 				echo "</div></fieldset>\n";
 				if ($_POST["search"] && $_POST["query"] != "") {
 					$_GET["where"][0]["op"] = $_POST["op"];
@@ -22954,15 +23007,28 @@ if (adminer()->homepage()) {
 			echo script("mixin(qsl('table'), {onclick: tableClick, ondblclick: partialArg(tableClick, true)});");
 			echo '<thead><tr class="wrap">';
 			echo '<td><input id="check-all" type="checkbox" class="jsonly">' . script("qs('#check-all').onclick = partial(formCheck, /^(tables|views)\[/);", "");
-			echo '<th>' . lang(132);
-			echo '<td>' . lang(268) . doc_link(array('sql' => 'storage-engines.html'));
-			echo '<td>' . lang(122) . doc_link(array('sql' => 'charset-charsets.html', 'mariadb' => 'supported-character-sets-and-collations/'));
-			echo '<td>' . lang(269) . doc_link(array('sql' => 'show-table-status.html',  ));
-			echo '<td>' . lang(270) . doc_link(array('sql' => 'show-table-status.html', ));
-			echo '<td>' . lang(271) . doc_link(array('sql' => 'show-table-status.html'));
-			echo '<td>' . lang(42) . doc_link(array('sql' => 'example-auto-increment.html', 'mariadb' => 'auto_increment/'));
-			echo '<td>' . lang(272) . doc_link(array('sql' => 'show-table-status.html',  ));
-			echo (support("comment") ? '<td>' . lang(41) . doc_link(array('sql' => 'show-table-status.html', )) : '');
+			echo '<th>' . lang(133);
+			$columns = array("Engine" => array(lang(269) . doc_link(array('sql' => 'storage-engines.html'))));
+			if (collations()) {
+				$columns["Collation"] = array(lang(123) . doc_link(array('sql' => 'charset-charsets.html', 'mariadb' => 'supported-character-sets-and-collations/')));
+			}
+			if (function_exists('Adminer\alter_table')) {
+				$columns["Data_length"] = array(lang(270) . doc_link(array('sql' => 'show-table-status.html',  )), "create", lang(36));
+			}
+			if (support('indexes')) {
+				$columns["Index_length"] = array(lang(271) . doc_link(array('sql' => 'show-table-status.html', )), "indexes", lang(136));
+			}
+			$columns["Data_free"] = array(lang(272) . doc_link(array('sql' => 'show-table-status.html')), "edit", lang(37));
+			if (function_exists('Adminer\alter_table')) {
+				$columns["Auto_increment"] = array(lang(43) . doc_link(array('sql' => 'example-auto-increment.html', 'mariadb' => 'auto_increment/')), "auto_increment=1&create", lang(36));
+			}
+			$columns["Rows"] = array(lang(273) . doc_link(array('sql' => 'show-table-status.html',  )), "select", lang(33));
+			if (support("comment")) {
+				$columns["Comment"] = array(lang(42) . doc_link(array('sql' => 'show-table-status.html', )));
+			}
+			foreach ($columns as $column) {
+				echo "<td>$column[0]";
+			}
 			echo "</thead>\n";
 
 			$tables = 0;
@@ -22970,40 +23036,29 @@ if (adminer()->homepage()) {
 				$view = ($type !== null && !preg_match('~table|sequence~i', $type));
 				$id = h("Table-" . $name);
 				echo '<tr><td>' . checkbox(($view ? "views[]" : "tables[]"), $name, in_array("$name", $tables_views, true), "", "", "", $id); // "$name" to check numeric table names
-				echo '<th>' . (support("table") || support("indexes") ? "<a href='" . h(ME) . "table=" . urlencode($name) . "' title='" . lang(33) . "' id='$id'>" . h($name) . '</a>' : h($name));
+				echo '<th>' . (support("table") || support("indexes") ? "<a href='" . h(ME) . "table=" . urlencode($name) . "' title='" . lang(34) . "' id='$id'>" . h($name) . '</a>' : h($name));
 				if ($view && !preg_match('~materialized~i', $type)) {
-					$title = lang(131);
+					$title = lang(132);
 					echo '<td colspan="6">' . (support("view") ? "<a href='" . h(ME) . "view=" . urlencode($name) . "' title='" . lang(35) . "'>$title</a>" : $title);
-					echo '<td align="right"><a href="' . h(ME) . "select=" . urlencode($name) . '" title="' . lang(32) . '">?</a>';
+					echo '<td align="right"><a href="' . h(ME) . "select=" . urlencode($name) . '" title="' . lang(33) . '">?</a>';
 				} else {
-					foreach (
-						array(
-							"Engine" => array(),
-							"Collation" => array(),
-							"Data_length" => array("create", lang(34)),
-							"Index_length" => array("indexes", lang(135)),
-							"Data_free" => array("edit", lang(36)),
-							"Auto_increment" => array("auto_increment=1&create", lang(34)),
-							"Rows" => array("select", lang(32)),
-						) as $key => $link
-					) {
+					foreach ($columns as $key => $column) {
 						$id = " id='$key-" . h($name) . "'";
-						echo ($link ? "<td align='right'>" . (support("table") || $key == "Rows" || (support("indexes") && $key != "Data_length")
-							? "<a href='" . h(ME . "$link[0]=") . urlencode($name) . "'$id title='$link[1]'>?</a>"
-							: "<span$id>?</span>"
-						) : "<td id='$key-" . h($name) . "'>");
+						echo ($column[1]
+							? "<td align='right'><a href='" . h(ME . "$column[1]=") . urlencode($name) . "'$id title='$column[2]'>?</a>"
+							: "<td id='$key-" . h($name) . "'>"
+						);
 					}
 					$tables++;
 				}
-				echo (support("comment") ? "<td id='Comment-" . h($name) . "'>" : "");
 				echo "\n";
 			}
 
-			echo "<tr><td><th>" . lang(244, count($tables_list));
+			echo "<tr><td><th>" . lang(245, count($tables_list));
 			echo "<td>" . h(JUSH == "sql" ? get_val("SELECT @@default_storage_engine") : "");
 			echo "<td>" . h(db_collation(DB, collations()));
 			foreach (array("Data_length", "Index_length", "Data_free") as $key) {
-				echo "<td align='right' id='sum-$key'>";
+				echo ($columns[$key] ? "<td align='right' id='sum-$key'>" : "");
 			}
 			echo "\n";
 
@@ -23011,28 +23066,27 @@ if (adminer()->homepage()) {
 			echo script("ajaxSetHtml('" . js_escape(ME) . "script=db');");
 			echo "</div>\n";
 			if (!information_schema(DB)) {
-				echo "<div class='footer'><div>\n";
-				$vacuum = "<input type='submit' value='" . lang(273) . "'> " . on_help("'VACUUM'");
-				$optimize = "<input type='submit' name='optimize' value='" . lang(274) . "'> " . on_help(JUSH == "sql" ? "'OPTIMIZE TABLE'" : "'VACUUM OPTIMIZE'");
-				echo "<fieldset><legend>" . lang(126) . " <span id='selected'></span></legend><div>"
-				. (JUSH == "sqlite" ? $vacuum . "<input type='submit' name='check' value='" . lang(275) . "'> " . on_help("'PRAGMA integrity_check'")
+				$vacuum = "<input type='submit' value='" . lang(274) . "'> " . on_help("'VACUUM'");
+				$optimize = "<input type='submit' name='optimize' value='" . lang(275) . "'> " . on_help(JUSH == "sql" ? "'OPTIMIZE TABLE'" : "'VACUUM OPTIMIZE'");
+				$print = (JUSH == "sqlite" ? $vacuum . "<input type='submit' name='check' value='" . lang(276) . "'> " . on_help("'PRAGMA integrity_check'")
 				: (JUSH == "pgsql" ? $vacuum . $optimize
-				: (JUSH == "sql" ? "<input type='submit' value='" . lang(276) . "'> " . on_help("'ANALYZE TABLE'")
+				: (JUSH == "sql" ? "<input type='submit' value='" . lang(277) . "'> " . on_help("'ANALYZE TABLE'")
 					. $optimize
-					. "<input type='submit' name='check' value='" . lang(275) . "'> " . on_help("'CHECK TABLE'")
-					. "<input type='submit' name='repair' value='" . lang(277) . "'> " . on_help("'REPAIR TABLE'")
+					. "<input type='submit' name='check' value='" . lang(276) . "'> " . on_help("'CHECK TABLE'")
+					. "<input type='submit' name='repair' value='" . lang(278) . "'> " . on_help("'REPAIR TABLE'")
 				: "")))
-				. "<input type='submit' name='truncate' value='" . lang(278) . "'> " . on_help(JUSH == "sqlite" ? "'DELETE'" : "'TRUNCATE" . (JUSH == "pgsql" ? "'" : " TABLE'")) . confirm()
-				. "<input type='submit' name='drop' value='" . lang(127) . "'>" . on_help("'DROP TABLE'") . confirm() . "\n";
+				. (function_exists('Adminer\truncate_tables') ? "<input type='submit' name='truncate' value='" . lang(279) . "'> " . on_help(JUSH == "sqlite" ? "'DELETE'" : "'TRUNCATE" . (JUSH == "pgsql" ? "'" : " TABLE'")) . confirm() : "")
+				. (function_exists('Adminer\drop_tables') ? "<input type='submit' name='drop' value='" . lang(128) . "'>" . on_help("'DROP TABLE'") . confirm() : "");
+				echo ($print ? "<div class='footer'><div>\n<fieldset><legend>" . lang(127) . " <span id='selected'></span></legend><div>$print\n</div></fieldset>\n" : "");
+
 				$databases = (support("scheme") ? adminer()->schemas() : adminer()->databases());
-				echo "</div></fieldset>\n";
 				$script = "";
 				if (count($databases) != 1 && JUSH != "sqlite") {
-					echo "<fieldset><legend>" . lang(279) . " <span id='selected3'></span></legend><div>";
+					echo "<fieldset><legend>" . lang(280) . " <span id='selected3'></span></legend><div>";
 					$db = (isset($_POST["target"]) ? $_POST["target"] : (support("scheme") ? $_GET["ns"] : DB));
 					echo ($databases ? html_select("target", $databases, $db) : '<input name="target" value="' . h($db) . '" autocapitalize="off">');
-					echo "</label> <input type='submit' name='move' value='" . lang(280) . "'>";
-					echo (support("copy") ? " <input type='submit' name='copy' value='" . lang(281) . "'> " . checkbox("overwrite", 1, $_POST["overwrite"], lang(282)) : "");
+					echo "</label> <input type='submit' name='move' value='" . lang(281) . "'>";
+					echo (support("copy") ? " <input type='submit' name='copy' value='" . lang(282) . "'> " . checkbox("overwrite", 1, $_POST["overwrite"], lang(283)) : "");
 					echo "</div></fieldset>\n";
 					$script = " selectCount('selected3', formChecked(this, /^(tables|views)\[/));";
 				}
@@ -23048,28 +23102,28 @@ if (adminer()->homepage()) {
 			echo script("tableCheck();");
 		}
 
-		echo "<p class='links'><a href='" . h(ME) . "create='>" . lang(68) . "</a>\n";
-		echo (support("view") ? "<a href='" . h(ME) . "view='>" . lang(206) . "</a>\n" : "");
+		echo (function_exists('Adminer\alter_table') ? "<p class='links'><a href='" . h(ME) . "create='>" . lang(69) . "</a>\n" : '');
+		echo (support("view") ? "<a href='" . h(ME) . "view='>" . lang(207) . "</a>\n" : "");
 
 		if (support("routine")) {
-			echo "<h3 id='routines'>" . lang(63) . "</h3>\n";
+			echo "<h3 id='routines'>" . lang(64) . "</h3>\n";
 			$routines = routines();
 			if ($routines) {
 				echo "<table class='odds'>\n";
-				echo '<thead><tr><th>' . lang(187) . '<td>' . lang(40) . '<td>' . lang(223) . "<td></thead>\n";
+				echo '<thead><tr><th>' . lang(188) . '<td>' . lang(41) . '<td>' . lang(224) . "<td></thead>\n";
 				foreach ($routines as $row) {
 					$name = ($row["SPECIFIC_NAME"] == $row["ROUTINE_NAME"] ? "" : "&name=" . urlencode($row["ROUTINE_NAME"])); // not computed on the pages to be able to print the header first
 					echo '<tr>';
 					echo '<th><a href="' . h(ME . ($row["ROUTINE_TYPE"] != "PROCEDURE" ? 'callf=' : 'call=') . urlencode($row["SPECIFIC_NAME"]) . $name) . '">' . h($row["ROUTINE_NAME"]) . '</a>';
 					echo '<td>' . h($row["ROUTINE_TYPE"]);
 					echo '<td>' . h($row["DTD_IDENTIFIER"]);
-					echo '<td><a href="' . h(ME . ($row["ROUTINE_TYPE"] != "PROCEDURE" ? 'function=' : 'procedure=') . urlencode($row["SPECIFIC_NAME"]) . $name) . '">' . lang(138) . "</a>";
+					echo '<td><a href="' . h(ME . ($row["ROUTINE_TYPE"] != "PROCEDURE" ? 'function=' : 'procedure=') . urlencode($row["SPECIFIC_NAME"]) . $name) . '">' . lang(139) . "</a>";
 				}
 				echo "</table>\n";
 			}
 			echo '<p class="links">'
-				. (support("procedure") ? '<a href="' . h(ME) . 'procedure=">' . lang(222) . '</a>' : '')
-				. '<a href="' . h(ME) . 'function=">' . lang(221) . "</a>\n"
+				. (support("procedure") ? '<a href="' . h(ME) . 'procedure=">' . lang(223) . '</a>' : '')
+				. '<a href="' . h(ME) . 'function=">' . lang(222) . "</a>\n"
 			;
 		}
 
@@ -23078,17 +23132,17 @@ if (adminer()->homepage()) {
 
 
 		if (support("event")) {
-			echo "<h3 id='events'>" . lang(65) . "</h3>\n";
+			echo "<h3 id='events'>" . lang(66) . "</h3>\n";
 			$rows = get_rows("SHOW EVENTS");
 			if ($rows) {
 				echo "<table>\n";
-				echo "<thead><tr><th>" . lang(187) . "<td>" . lang(283) . "<td>" . lang(212) . "<td>" . lang(213) . "<td></thead>\n";
+				echo "<thead><tr><th>" . lang(188) . "<td>" . lang(284) . "<td>" . lang(213) . "<td>" . lang(214) . "<td></thead>\n";
 				foreach ($rows as $row) {
 					echo "<tr>";
 					echo "<th>" . h($row["Name"]);
-					echo "<td>" . ($row["Execute at"] ? lang(284) . "<td>" . $row["Execute at"] : lang(214) . " " . $row["Interval value"] . " " . $row["Interval field"] . "<td>$row[Starts]");
+					echo "<td>" . ($row["Execute at"] ? lang(285) . "<td>" . $row["Execute at"] : lang(215) . " " . $row["Interval value"] . " " . $row["Interval field"] . "<td>$row[Starts]");
 					echo "<td>$row[Ends]";
-					echo '<td><a href="' . h(ME) . 'event=' . urlencode($row["Name"]) . '">' . lang(138) . '</a>';
+					echo '<td><a href="' . h(ME) . 'event=' . urlencode($row["Name"]) . '">' . lang(139) . '</a>';
 				}
 				echo "</table>\n";
 				$event_scheduler = get_val("SELECT @@event_scheduler");
@@ -23096,7 +23150,7 @@ if (adminer()->homepage()) {
 					echo "<p class='error'><code class='jush-sqlset'>event_scheduler</code>: " . h($event_scheduler) . "\n";
 				}
 			}
-			echo '<p class="links"><a href="' . h(ME) . 'event=">' . lang(211) . "</a>\n";
+			echo '<p class="links"><a href="' . h(ME) . 'event=">' . lang(212) . "</a>\n";
 		}
 	}
 }
